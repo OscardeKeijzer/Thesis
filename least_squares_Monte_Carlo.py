@@ -426,21 +426,6 @@ def price_Bermudan_swaption_LSM_Q(a_param: float,
         raise ValueError('no swaption payoff variable was specified.' 
                          + ' Enter as "swap" or "forward".')
         
-    ## Adjust the exercise date depending on the pricing time
-    # time_t_idx = np.searchsorted(exercise_dates, time_t)
-    # print(f'time_t_idx: {time_t_idx}')
-    # exercise_dates = exercise_dates[time_t_idx:]
-    # print(f'exercise_dates: {exercise_dates}')
-    n_exercise = len(exercise_dates)
-    # print(f'n_exercise: {n_exercise}')
-    
-    # # Determine the monitor dates that are relevant at the pricing time and 
-    # # adjust the tenor structure accordingly
-    # first_monitor_date_idx = np.searchsorted(tenor_structure, time_t)
-    # print(f'time_t: {time_t}')
-    # print(f'first_monitor_date_idx: {first_monitor_date_idx}')
-    # tenor_structure = tenor_structure[first_monitor_date_idx:]
-    
     # Evaluate the number of paths and the tenor
     n_paths = r_t_paths.shape[1]
     tenor = len(tenor_structure)
@@ -451,6 +436,7 @@ def price_Bermudan_swaption_LSM_Q(a_param: float,
     ## points
     
     # Initialize arrays for storing the pathwise payoffs
+    n_exercise = len(exercise_dates)
     payoff_matrix = np.zeros((n_exercise, n_paths))
     live_paths_array = np.ones((n_exercise+1, n_paths), dtype=int)
     pathwise_stopping_times = np.zeros((n_exercise, n_paths), dtype=int)
@@ -492,8 +478,6 @@ def price_Bermudan_swaption_LSM_Q(a_param: float,
         time_T_m = exercise_dates[0]
         T_current_idx = int(time_T_m*n_annual_trading_days)
         tenor_idx = np.searchsorted(tenor_structure, time_T_m)
-        # print(f'tenor_idx: {tenor_idx}')
-        # print(f'exercise_dates[tenor_idx]: {exercise_dates[tenor_idx]}')
         
         # Select the cashflows corresponding to the current monitor dates
         current_exercise = payoff_matrix[tenor_idx]
@@ -536,7 +520,6 @@ def price_Bermudan_swaption_LSM_Q(a_param: float,
             else:
                 raise ValueError('regression series not recognized.' 
                                  + ' Enter as "Laguerre" or "power".')
-            # print(f'cond_exp_func: {cond_exp_func}')
             
             cashflow_matrix[tenor_idx,
                             itm_path_idxs] = np.where(current_exercise[itm_path_idxs] 
@@ -575,8 +558,6 @@ def price_Bermudan_swaption_LSM_Q(a_param: float,
             # matrix
             T_current_idx = int(time_T_m*n_annual_trading_days)
             ex_date_idx = np.searchsorted(exercise_dates, time_T_m)
-            # print(f'exercise_dates[ex_date_idx]: {exercise_dates[ex_date_idx]}')
-            # print(f'ex_date_idx: {ex_date_idx}')
             
             time_T_m_next = exercise_dates[ex_date_idx+1]
             discount_factors = eval_discount_factors(n_annual_trading_days, 
@@ -644,8 +625,6 @@ def price_Bermudan_swaption_LSM_Q(a_param: float,
                                                                > continuation_values)]
                 cashflow_matrix[ex_date_idx,exercised_itm_idxs] = current_exercise[exercised_itm_idxs]
                 cashflow_matrix[ex_date_idx+1:,exercised_itm_idxs] = 0
-                # print(f'time_T_m: {time_T_m}')
-                # print(f'ex_date_idx: {ex_date_idx}')
                 live_paths_array[ex_date_idx+2:,exercised_itm_idxs] = 0
                 pathwise_stopping_times[ex_date_idx,exercised_itm_idxs] = 1
                 pathwise_stopping_times[ex_date_idx+1:,exercised_itm_idxs] = 0
@@ -672,9 +651,6 @@ def price_Bermudan_swaption_LSM_Q(a_param: float,
                                                       r_t_paths, time_t, 
                                                       exercise_dates[0])
     swaption_price_vector = discount_factors_t_vector*cashflow_matrix[0]
-    
-    # print(f'payoff_matrix: {payoff_matrix[:,:5]}')
-    # print(f'cashflow_matrix: {cashflow_matrix[:,:5]}')
             
     if verbose:
         # Print the LSM price and standard error
@@ -722,40 +698,12 @@ def future_price_Bermudan_swaption_LSM_Q(a_param: float,
                                                         time_0_P_curve)
     
     time_t_idx = int(time_t*n_annual_trading_days)
-    # current_x_t = x_t_paths[time_t_idx]
     n_paths = np.shape(x_t_paths)[1]
-    # print(f'np.shape(current_x_t): {np.shape(current_x_t)}')
     
     ex_date_idx = np.searchsorted(exercise_dates, time_t)
     exercise_date = exercise_dates[ex_date_idx]
-    # print(f'exercise_date: {exercise_date}')
     discount_factors = eval_discount_factors(n_annual_trading_days, r_t_paths, 
                                              time_t, exercise_date)
-    
-    # tenor_idx = np.searchsorted(tenor_structure, time_t)
-    # # print(f'time_t: {time_t}')
-    # # print(f'tenor_idx: {tenor_idx}')
-    # current_exercise = np.maximum(price_forward_start_swap(a_param, fixed_rate, 
-    #                                         n_annual_trading_days, notional, 
-    #                                         payoff_var, plot_timeline, 
-    #                                         r_t_paths, sigma, swaption_type, 
-    #                                         tenor_structure[tenor_idx:], 
-    #                                         time_t, 
-    #                                         time_0_f_curve, time_0_P_curve, 
-    #                                         units_basis_points, x_t_paths), 0)
-    # # print(f'mean current exercise: {np.mean(current_exercise)}')
-    
-    # itm_idxs = np.where(current_exercise>0)[0]
-    # otm_idxs = np.where(current_exercise<=0)[0]
-    # # print(f'np.shape(itm_idxs): {np.shape(itm_idxs)}')
-    # # print(f'itm_idxs: {itm_idxs}')
-    # # print(f'np.shape(otm_idxs): {np.shape(otm_idxs)}')
-    # # print(f'otm_idxs: {otm_idxs}')
-    # current_x_t_itm = current_x_t[itm_idxs]
-    # current_x_t_otm = current_x_t[otm_idxs]
-    
-    
-    
     ZCBs_t = construct_zero_coupon_bonds_curve(a_param, experiment_dir, 
                                                 tenor_structure[-1], 
                                                 n_annual_trading_days, False, 
@@ -765,13 +713,8 @@ def future_price_Bermudan_swaption_LSM_Q(a_param: float,
     tenor_idx = np.searchsorted(tenor_structure, time_t)
     pathwise_swap_rates = eval_swap_rate(ZCBs_t, n_annual_trading_days, 
                                           tenor_structure[tenor_idx:], time_t)
-    # # print(f'mean swap rate: {np.mean(pathwise_swap_rates)}')
-    # # print(f'fixed_rate: {fixed_rate}')
-    # # print(f'n_swap_rates > fixed_rate: {len(pathwise_swap_rates[pathwise_swap_rates>fixed_rate])}')
     itm_idxs = np.where(pathwise_swap_rates<fixed_rate)[0]
     otm_idxs = np.where(pathwise_swap_rates>=fixed_rate)[0]
-    # # print(f'len(itm_idxs): {len(itm_idxs)}')
-    # # print(f'len(otm_idxs): {len(otm_idxs)}')
     
     current_x_t_itm = pathwise_swap_rates[itm_idxs]
     current_x_t_otm = pathwise_swap_rates[otm_idxs]
@@ -791,8 +734,6 @@ def future_price_Bermudan_swaption_LSM_Q(a_param: float,
                                      *cashflow_matrix[future_cashflow_date_idx,itm_idxs])
         disc_future_cashflows_otm = (disc_factors[otm_idxs]
                                      *cashflow_matrix[future_cashflow_date_idx,otm_idxs])
-        # disc_future_cashflows_itm = cashflow_matrix[ex_date_idx,itm_idxs]
-        # disc_future_cashflows_otm = cashflow_matrix[ex_date_idx,otm_idxs]
     
     # Regress the in-the-money and out-of-the-money future cashflows on the 
     # current zero-mean process values

@@ -51,12 +51,16 @@ from interest_rate_functions import (eval_annuity_terms,
                                      eval_swap_rate,
                                      interpolate_zero_rate)
 from least_squares_Monte_Carlo import (price_Bermudan_stock_option_LSM, 
-                                       price_Bermudan_swaption_LSM_Q)
+                                       future_price_Bermudan_swaption_LSM_Q, 
+                                       price_Bermudan_swaption_LSM_Q,
+                                       price_Bermudan_swaption_LSM_Q_OLD)
 from one_factor_Hull_White_model import (eval_discount_factors, 
                                          one_factor_Hull_White_exp_Q, 
                                          one_factor_Hull_White_var, 
                                          gen_one_factor_Hull_White_paths)
-from plotting_functions import (plot_time_series, 
+from plotting_functions import (plot_Bermudan_swaption_timeline, 
+                                plot_forward_start_swap_timeline, 
+                                plot_time_series, 
                                 plot_one_factor_Hull_White_histogram, 
                                 visualize_neural_network)
 from swaps import (eval_moneyness_adjusted_fixed_rate, 
@@ -751,6 +755,7 @@ class BermudanSwaptionLSM:
                                       tenor_structure: list,
                                       time_t: float,
                                       units_basis_points: bool,
+                                      exercise_dates: list = None,
                                       payoff_var: str = 'swap',
                                       plot_regression: bool = False,
                                       plot_timeline: bool = False,
@@ -828,6 +833,7 @@ class BermudanSwaptionLSM:
             self.se_LSM_price: the standard error of the pathwise LSM prices.
         """
         self.degree = degree
+        self.exercise_dates = exercise_dates
         self.fixed_rate = fixed_rate
         self.notional = notional
         self.payoff_var = payoff_var
@@ -850,10 +856,29 @@ class BermudanSwaptionLSM:
                                             self.model.n_annual_trading_days, 
                                             swaption_type, tenor_structure, 
                                             self.model.time_0_P_curve)
+            
+        # Check whether tenor structure was passed as a list or ndarray and 
+        # assign the monitor dates
+        tenor_structure = (tenor_structure if isinstance(tenor_structure, 
+                                                              np.ndarray)
+                           else np.array(tenor_structure))
+        monitor_dates = tenor_structure[:-1]
+        self.maturity = tenor_structure[-1]
+            
+        # If exercise dates were specified, check whether they are a subset 
+        # of the monitor dates
+        if exercise_dates is not None: 
+            if set(exercise_dates) <= set(tenor_structure[:-1]):
+                self.exercise_dates = (exercise_dates if isinstance(exercise_dates, 
+                                                               np.ndarray)
+                                  else np.array(exercise_dates))
+        else:
+            self.exercise_dates = monitor_dates
         
         (self.pathwise_LSM_prices, 
          self.live_paths_array, 
-         self.pathwise_stopping_times) = price_Bermudan_swaption_LSM_Q(
+         self.pathwise_stopping_times, 
+         self.cashflow_matrix) = price_Bermudan_swaption_LSM_Q(
                                                 self.model.a_param, 
                                                 degree, 
                                                 self.model.experiment_dir, 
@@ -869,11 +894,173 @@ class BermudanSwaptionLSM:
                                                 self.model.time_0_f_curve, 
                                                 self.model.time_0_P_curve, 
                                                 units_basis_points, x_t_paths, 
-                                                verbose)
+                                                self.exercise_dates, verbose)
         
         self.mean_LSM_price = np.mean(self.pathwise_LSM_prices)
         self.se_LSM_price = st.sem(self.pathwise_LSM_prices)
         
+    def future_price_Bermudan_swaption_LSM_Q(self, 
+                                             time_t, 
+                                             r_t_paths: list = None, 
+                                             x_t_paths: list = None):
+        if not hasattr(self, 'live_paths_array'):
+            raise ValueError('LSM exercise strategies not yet evaluated. Use ' 
+                             + 'the price_Bermudan_swaption_LSM_Q() function.')
+            
+        if r_t_paths is None:
+            r_t_paths = self.model.r_t_paths
+        if x_t_paths is None:
+            x_t_paths = self.model.x_t_paths
+            
+        ex_strat_idx = np.searchsorted(self.exercise_dates, time_t, side='right')
+        # print(f'time_t: {time_t}')
+        # print(f'LSM ex_strat_idx: {ex_strat_idx}\n')
+        self.future_LSM_prices = (self.live_paths_array[ex_strat_idx]
+                                  *future_price_Bermudan_swaption_LSM_Q(
+                                                self.model.a_param, 
+                                                self.cashflow_matrix, 
+                                                self.degree, 
+                                                self.model.experiment_dir, 
+                                                self.fixed_rate, 
+                                                self.moneyness, 
+                                                self.model.n_annual_trading_days, 
+                                                self.notional, self.payoff_var, 
+                                                self.plot_regression, 
+                                                self.plot_timeline, 
+                                                self.regression_series, 
+                                                r_t_paths, self.model.sigma, 
+                                                self.swaption_type, 
+                                                self.tenor_structure, time_t, 
+                                                self.model.time_0_dfdt_curve, 
+                                                self.model.time_0_f_curve, 
+                                                self.model.time_0_P_curve, 
+                                                self.units_basis_points, 
+                                                x_t_paths, self.exercise_dates))
+        
+        self.mean_future_LSM_price = np.mean(self.future_LSM_prices)
+        self.se_future_LSM_price = st.sem(self.future_LSM_prices)
+
+    def eval_EPE_profile(self,
+                         eval_times,
+                         r_t_paths: list = None,
+                         x_t_paths: list = None):
+        if not hasattr(self, 'live_paths_array'):
+            raise ValueError('LSM exercise strategies not yet evaluated. Use ' 
+                             + 'the price_Bermudan_swaption_LSM_Q() function.')
+            
+        ## Check whether specific evaluation times were passed
+        if eval_times is not None:
+            self.EPE_eval_times = eval_times
+            
+            if not isinstance(eval_times, np.ndarray):
+                eval_times = np.array([eval_times])
+                
+                if eval_times[-1] <= self.exercise_dates[-1]:
+                    self.EPE_eval_times = eval_times
+                else:
+                    raise ValueError('the passed exposure evaluation times may ' 
+                                      + 'not surpass the last exercise date of ' 
+                                      + f'{self.exercise_dates[-1]} years.')
+        # If not, evaluate the EPE biweekly from time zero until the last 
+        # exercise date
+        else:
+            self.EPE_eval_times = np.linspace(0., self.exercise_dates[-1], 
+                                              num=24*int(self.exercise_dates[-1])+1)
+            
+        # Add all exercise dates to the evaluation times
+        self.EPE_eval_times = np.unique(np.concatenate((self.EPE_eval_times, 
+                                                        self.exercise_dates)))
+        
+        ## Compute the exposures
+        if r_t_paths is not None and x_t_paths is not None:
+            self.EPE_r_t_paths = r_t_paths
+            self.EPE_x_t_paths = x_t_paths
+        n_paths = np.shape(self.EPE_x_t_paths)[1]
+        n_eval_times = len(self.EPE_eval_times)
+        
+        T_last_ex = self.exercise_dates[-1]
+        T_last_ex_tenor_idx = np.searchsorted(self.tenor_structure, T_last_ex)
+        self.EPE_LSM = np.zeros((n_eval_times, n_paths))
+        T_last_ex_strat_idx = np.searchsorted(self.tenor_structure, T_last_ex, 
+                                              side='right')
+        V_T_last_underlying_swap = price_forward_start_swap(self.model.a_param, 
+                                            self.fixed_rate, 
+                                            self.model.n_annual_trading_days, 
+                                            self.notional, 'swap', 
+                                            False, self.EPE_r_t_paths, 
+                                            self.model.sigma, 
+                                            self.swaption_type, 
+                                            self.tenor_structure[T_last_ex_tenor_idx:], 
+                                            T_last_ex, 
+                                            self.model.time_0_f_curve, 
+                                            self.model.time_0_P_curve, 
+                                            self.units_basis_points, 
+                                            self.EPE_x_t_paths)
+        self.EPE_LSM[-1] = np.maximum(self.live_paths_array[T_last_ex_strat_idx]
+                                      *V_T_last_underlying_swap, 0.)
+        
+        for count, eval_time in enumerate(self.EPE_eval_times[-2::-1]):
+            rev_count = n_eval_times - 2 - count
+            
+            if eval_time in self.exercise_dates[1:]:
+                self.future_price_Bermudan_swaption_LSM_Q(eval_time-1, ## <=== WHY DOES -1 YIELD CORRECT PROFILE????
+                                                          self.EPE_r_t_paths, 
+                                                          self.EPE_x_t_paths)
+                self.EPE_LSM[rev_count] = self.future_LSM_prices
+            elif eval_time == self.exercise_dates[0]:
+                self.price_Bermudan_swaption_LSM_Q(self.degree, self.fixed_rate, 
+                                                   self.moneyness, self.notional, 
+                                                   self.swaption_type, 
+                                                   self.tenor_structure, 
+                                                   eval_time, 
+                                                   self.units_basis_points, 
+                                                   r_t_paths=self.EPE_r_t_paths, 
+                                                   x_t_paths=self.EPE_x_t_paths)
+                self.EPE_LSM[rev_count] = self.pathwise_LSM_prices
+            elif not eval_time in self.exercise_dates:
+                next_eval_EPE_idx = np.searchsorted(self.EPE_eval_times, 
+                                                    eval_time, side='right')
+                next_eval_time = self.EPE_eval_times[next_eval_EPE_idx]
+                # print(f'next_eval_time: {next_eval_time}')
+                df = eval_discount_factors(self.model.n_annual_trading_days, 
+                                           self.EPE_r_t_paths, eval_time, 
+                                           next_eval_time)
+                self.EPE_LSM[rev_count] = df*self.EPE_LSM[rev_count+1]
+            
+            
+        # Discount the entire profile back to time zero
+        for count, eval_time in enumerate(self.EPE_eval_times):
+            disc_factors = eval_discount_factors(self.model.n_annual_trading_days, 
+                                                 self.EPE_r_t_paths, 0., 
+                                                 eval_time)
+            self.EPE_LSM[count] = disc_factors*self.EPE_LSM[count]
+            
+        self.mean_EPE_LSM = np.mean(self.EPE_LSM, axis=1)
+        
+    def plot_timeline(self):
+        """
+        Info: this method visualizes the timeline of the Bermudan swaption.
+        """
+        # Evaluate mean floating rates
+        floating_rates = np.zeros_like(self.exercise_dates)
+        for count, ex_date in enumerate(self.exercise_dates):
+            ZCBs_t = construct_zero_coupon_bonds_curve(self.model.a_param, 
+                                            self.experiment_dir, self.maturity, 
+                                            self.model.n_annual_trading_days, 
+                                            False, self.model.r_t_paths, 
+                                            self.model.sigma, ex_date, 
+                                            self.model.time_0_f_curve, 
+                                            self.model.time_0_P_curve, 
+                                            self.model.x_t_paths)
+            floating_rate = eval_swap_rate(ZCBs_t, 
+                                           self.model.n_annual_trading_days, 
+                                           self.tenor_structure, ex_date)
+            floating_rates[count] = np.mean(floating_rate)
+        
+        plot_Bermudan_swaption_timeline(self.fixed_rate, floating_rates, 
+                                        self.swaption_type, 
+                                        self.tenor_structure)
+            
     def eval_forward_sensitivities_bump_and_revalue_ISDA_SIMM(self, 
                                                        bump_time: float, 
                                                        eval_time: float, 
@@ -1136,25 +1323,40 @@ class BermudanSwaptionRLNN:
                  moneyness: bool,
                  swaption_type: str,
                  tenor_structure: list,
+                 exercise_dates: list = None,
                  n_run : int = None,
                  units_basis_points: bool = False
                 ) -> object:
         
-        # Assign main parameters from constructor input
+        ## Assign main parameters from constructor input
         self.fixed_rate = fixed_rate
         self.model = model
         self.notional  = notional
         self.moneyness = moneyness
         self.swaption_type = swaption_type
+        
+        # Check whether tenor structure was passed as a list or ndarray and 
+        # assign the monitor dates
         self.tenor_structure = (tenor_structure if isinstance(tenor_structure, 
                                                               np.ndarray)
                                 else np.array(tenor_structure))
+        self.monitor_dates = self.tenor_structure[:-1]
+        
+        # If exercise dates were specified, check whether they are a subset 
+        # of the monitor dates
+        if exercise_dates and set(exercise_dates) <= set(tenor_structure[:-1]):
+            self.exercise_dates = (exercise_dates if isinstance(exercise_dates, 
+                                                                  np.ndarray)
+                                   else np.array(exercise_dates))
+        else:
+            self.exercise_dates = self.monitor_dates
+            
+        
         self.n_run = n_run
         self.units_basis_points = units_basis_points
         
         # Assign secondary parameters
-        self.expiry = self.tenor_structure[0]
-        self.monitor_dates = self.tenor_structure[:-1]
+        self.first_exercise = self.tenor_structure[0]
         self.maturity = self.tenor_structure[-1]
         self.tenor = len(self.tenor_structure)
         self.index = 0
@@ -1217,32 +1419,37 @@ class BermudanSwaptionRLNN:
         self.ZBO_portfolio_weights_list = []
         self.ZBO_portfolio_strikes_list = []
         
-        self.MSE = np.zeros(len(self.monitor_dates))
+        self.MSE = np.zeros(len(self.exercise_dates))
         
         ## Replication of the Bermudan swaption using zero-coupon bond options
-        # Iterate backward over the monitor dates
-        for count, monitor_date in enumerate(self.tenor_structure[-2::-1]):
-            t_monitor_idx = int(monitor_date*self.model.n_annual_trading_days)
-            t_idx_tenor = len(self.tenor_structure) - 2 - count
+        # Iterate backward over the exercise dates excluding the last one if it 
+        # corresponds to the last monitor date
+        for __, exercise_date in (enumerate(self.monitor_dates[-1::-1]) 
+                                    if np.array_equal(self.exercise_dates, 
+                                                      self.monitor_dates) 
+                                    else enumerate(self.exercise_dates[::-1])):
+
+            t_exercise_idx = int(exercise_date*self.model.n_annual_trading_days)
+            t_idx_tenor = np.searchsorted(self.tenor_structure, exercise_date)
             
             # Select the zero-mean process values as input for the neural 
             # network and then start the training procedure
-            x_t_in = self.model.x_t_paths[t_monitor_idx]
-            self.train(monitor_date, None, t_idx_tenor, t_monitor_idx, x_t_in, 
-                       batch_size=self.batch_size, learn_rate=self.learn_rate, 
-                       n_epochs=self.n_epochs, 
+            x_t_in = self.model.x_t_paths[t_exercise_idx]
+            self.train(exercise_date, None, t_exercise_idx, t_idx_tenor, 
+                       x_t_in, batch_size=self.batch_size, 
+                       learn_rate=self.learn_rate, n_epochs=self.n_epochs, 
                        n_hidden_nodes=self.n_hidden_nodes, 
                        save_weights=self.save_weights, test_fit=self.test_fit, 
                        train_size=self.train_size)
             
             # Construct the replicating portfolio at the current monitor date
-            self.construct_ZBO_portfolio()
+            self.construct_ZBO_portfolio(exercise_date)
             
     def train(self,
-              monitor_date: float,
+              exercise_date: float,
               neural_network: object,
-              t_idx_tenor: float,
-              t_monitor_idx: float,
+              t_exercise_idx: float,
+              t_idx_tenor: int,
               x_t_input: list,
               batch_size: int = 32,
               learn_rate: int = .0003,
@@ -1284,7 +1491,7 @@ class BermudanSwaptionRLNN:
                                 self.model.r_t_paths[:,self.x_train_idxs], 
                                 self.model.sigma, self.swaption_type, 
                                 self.tenor_structure[t_idx_tenor:], 
-                                monitor_date, self.model.time_0_f_curve, 
+                                exercise_date, self.model.time_0_f_curve, 
                                 self.model.time_0_P_curve, False, 
                                 self.model.x_t_paths[:,self.x_train_idxs]), 
                                 0.)
@@ -1294,6 +1501,7 @@ class BermudanSwaptionRLNN:
         # following monitor date
         # Initialize the continuation values array
         V_continuation = np.zeros_like(V_exercise)
+        
         
         # Select the corresponding short rate paths for discounting the 
         # continuation values
@@ -1305,25 +1513,53 @@ class BermudanSwaptionRLNN:
         # the zero-mean processes. For the final monitor date, the Bermudan 
         # swaption expires worthless and so the replicating portfolio values 
         # are set to zero.
-        
-        if monitor_date < self.tenor_structure[-2]:
-            ZBO_portfolio = np.zeros((len(self.current_ZBO_portfolio_weights), 
-                                      len(self.x_train)))
+        if exercise_date < self.exercise_dates[-1]:
+            # print(f'exercise_date: {exercise_date}')
+            current_ex_idx = np.searchsorted(self.exercise_dates, exercise_date)
+            next_tenor_idx = np.searchsorted(self.tenor_structure, 
+                                             self.exercise_dates[current_ex_idx+1])
+            strikes = self.ZBO_portfolio_strikes_list[0]
+            weights = self.ZBO_portfolio_weights_list[0]
+            ZBO_portfolio = np.zeros((len(strikes), len(self.x_train)))
             
-            for count, idx in enumerate(self.positive_strikes_idxs):
-                strike = self.current_ZBO_portfolio_strikes[count]
-                weight = self.current_ZBO_portfolio_weights[count]
+            # print(f'self.exercise_dates[current_ex_idx]: {self.exercise_dates[current_ex_idx]}')
+            # print(f'self.tenor_structure[next_tenor_idx]: {self.tenor_structure[next_tenor_idx]}')
+            
+            # for count, __ in enumerate(self.positive_strikes_idxs):
+            for count, (strike, weight) in enumerate(zip(strikes, weights)):
+                # strike = self.next_ZBO_portfolio_strikes[count]
+                # weight = self.ZBO_portfolio_strikes_list[0][count]
                 if self.swaption_type.lower() == 'payer':
                     option_type = 'call'
                 elif self.swaption_type.lower() == 'receiver':
                     option_type = 'put'
                 
-                ZBO_pathwise_prices = price_zero_coupon_bond_option_exact(
+                # if strike <= 0:
+                #     ZBO_pathwise_prices = np.zeros(len(self.x_train))
+                # else:
+                #     ZBO_pathwise_prices = price_zero_coupon_bond_option_exact(
+                #                             self.model.a_param, self.maturity, 
+                #                             self.tenor_structure[t_idx_tenor+1], 
+                #                             self.model.n_annual_trading_days, 
+                #                             option_type, None, self.model.sigma, 
+                #                             strike, exercise_date, 
+                #                             self.model.time_0_f_curve, 
+                #                             self.model.time_0_P_curve, False, 
+                #                             self.model.x_t_paths[:,self.x_train_idxs], 
+                #                             None)
+                
+                disc_factors = eval_discount_factors(self.model.n_annual_trading_days, 
+                                                      self.r_t_train, exercise_date, 
+                                                      self.tenor_structure[next_tenor_idx])
+                # disc_factors = 1.
+                
+                ZBO_pathwise_prices = disc_factors*price_zero_coupon_bond_option_exact(
                                             self.model.a_param, self.maturity, 
-                                            self.tenor_structure[t_idx_tenor+1], 
+                                            self.tenor_structure[next_tenor_idx], 
                                             self.model.n_annual_trading_days, 
                                             option_type, None, self.model.sigma, 
-                                            strike, monitor_date, self.model.time_0_f_curve, 
+                                            strike, exercise_date, 
+                                            self.model.time_0_f_curve, 
                                             self.model.time_0_P_curve, False, 
                                             self.model.x_t_paths[:,self.x_train_idxs], 
                                             None)
@@ -1341,9 +1577,8 @@ class BermudanSwaptionRLNN:
         # Evaluate the input zero-coupon bond prices
         self.z_in = price_zero_coupon_bond(self.model.a_param, 
                                         self.model.n_annual_trading_days, 
-                                        self.model.r_t_paths[t_monitor_idx,
-                                                             self.x_train_idxs], 
-                                        self.model.sigma, monitor_date, 
+                                        self.r_t_train[t_exercise_idx], 
+                                        self.model.sigma, exercise_date, 
                                         self.maturity, self.model.time_0_f_curve, 
                                         self.model.time_0_P_curve, 
                                         self.x_train)
@@ -1365,6 +1600,7 @@ class BermudanSwaptionRLNN:
         optimizer_Adamax = keras.optimizers.Adamax(learning_rate=self.learn_rate)
         self.neural_network.compile(loss='MSE', optimizer=optimizer_Adamax)
         
+        # self.save_weights = None
         if (self.save_weights is not None and self.index > 0):
             print('Loading weights...')
             weight_name = self.weights_dir + '\\Bermudan NN Weights' + str(self.index-1) + '.h5'
@@ -1374,24 +1610,23 @@ class BermudanSwaptionRLNN:
         
         callback_early_stopping = keras.callbacks.EarlyStopping(monitor='loss', 
                                                         mode='min', verbose=True, 
-                                                        patience=100, 
+                                                        patience=50, 
                                                         restore_best_weights=True)
         
-        print(f'Fitting neural network at monitor date {monitor_date}...')
+        print(f'Fitting neural network at exercise date {exercise_date}...')
         self.neural_network.fit(self.z_in_rescaled, self.y_train_rescaled, 
                                 epochs=self.n_epochs, verbose=False, 
                                 callbacks=[callback_early_stopping], 
                                 batch_size=self.batch_size)
-        self.neural_network.summary()
+        # self.neural_network.summary()
         
         # Save the MSE
         y_true = self.y_train_rescaled
         P_in = price_zero_coupon_bond(self.model.a_param, 
                                         self.model.n_annual_trading_days, 
-                                        self.model.r_t_paths[t_monitor_idx,
-                                                             self.x_train_idxs], 
+                                        self.r_t_train[t_exercise_idx], 
                                         self.model.sigma, 
-                                        monitor_date, self.maturity, 
+                                        exercise_date, self.maturity, 
                                         self.model.time_0_f_curve, 
                                         self.model.time_0_P_curve, 
                                         self.x_train)
@@ -1402,9 +1637,9 @@ class BermudanSwaptionRLNN:
         if self.test_fit:
             P_in = price_zero_coupon_bond(self.model.a_param, 
                                     self.model.n_annual_trading_days, 
-                                    self.model.r_t_paths[t_monitor_idx,
+                                    self.model.r_t_paths[t_exercise_idx,
                                                          self.x_test_idxs], 
-                                    self.model.sigma, monitor_date, 
+                                    self.model.sigma, exercise_date, 
                                     self.maturity, self.model.time_0_f_curve, 
                                     self.model.time_0_P_curve, self.x_test)
             x_test_scaled = (P_in - self.z_in_scale_b)/self.z_in_scale_w
@@ -1418,7 +1653,7 @@ class BermudanSwaptionRLNN:
             plt.xlabel('$x_t$')
             plt.title(f'{self.tenor_structure_notation} Bermudan ' 
                       + f'{self.swaption_type.capitalize()} Swaption' 
-                      + f'\nNeural Network Fit at $T$ = {monitor_date}')
+                      + f'\nNeural Network Fit at $T$ = {exercise_date}')
             plt.legend()
             plt.show()    
         
@@ -1433,7 +1668,9 @@ class BermudanSwaptionRLNN:
             self.neural_network.save_weights(name2)
             self.index += 1
             
-    def construct_ZBO_portfolio(self):
+    def construct_ZBO_portfolio(self,
+                                exercise_date: float
+                               ):
         """
         Info: this method constructs a portfolio of zero-coupon bond options 
             that replicates the Bermudan swaption at a given monitor date.
@@ -1466,17 +1703,19 @@ class BermudanSwaptionRLNN:
                               *self.y_train_scaling_factor)
         
         # Select the final weights and strikes for the portfolio
-        self.positive_strikes_idxs = np.where(portfolio_strikes > 0.)[0]
-        final_portfolio_weights = portfolio_weights[self.positive_strikes_idxs]
-        final_portfolio_strikes = portfolio_strikes[self.positive_strikes_idxs]
+        # if exercise_date < self.exercise_dates[0]:
+        #     print(f'Taking positive strikes only for replicating portfolio at time {exercise_date}')
+        #     self.positive_strikes_idxs = np.where(portfolio_strikes>0.)[0]
+        #     portfolio_weights = portfolio_weights[self.positive_strikes_idxs]
+        #     portfolio_strikes = portfolio_strikes[self.positive_strikes_idxs]
         
-        # Store the portfolio weights and strikes
-        self.current_ZBO_portfolio_weights = final_portfolio_weights
-        self.current_ZBO_portfolio_strikes = final_portfolio_strikes
+        self.positive_strikes_idxs = np.where(portfolio_strikes>0.)[0]
+        portfolio_weights = portfolio_weights[self.positive_strikes_idxs]
+        portfolio_strikes = portfolio_strikes[self.positive_strikes_idxs]
         
-        # Save ZBO portfolio weights and strikes in their respective lists
-        self.ZBO_portfolio_weights_list.insert(0, self.current_ZBO_portfolio_weights)
-        self.ZBO_portfolio_strikes_list.insert(0, self.current_ZBO_portfolio_strikes)
+        # Store the portfolio weights and strikes in their respective lists
+        self.ZBO_portfolio_weights_list.insert(0, portfolio_weights)
+        self.ZBO_portfolio_strikes_list.insert(0, portfolio_strikes)
         
     def price_direct_estimator(self,
                                time_t: float, 
@@ -1488,8 +1727,10 @@ class BermudanSwaptionRLNN:
             swaption using the previously constructed portfolio of zero-coupon 
             bond options.
         """
-        if time_t > self.tenor_structure[-2]:
-            raise ValueError('Bermudan swaption evaluation time occurs after last monitor date.')
+        if time_t > self.exercise_dates[-1]:
+            raise ValueError('Bermudan swaption evaluation time may not occur ' 
+                             + 'after last exercise date at ' 
+                             + f'{self.exercise_dates[-1]} years.')
         else:
             self.pricing_time = time_t
             
@@ -1511,63 +1752,265 @@ class BermudanSwaptionRLNN:
         
         # Select the replicating portfolio that corresponds to the pricing time
         n_paths = np.shape(self.pricing_x_t_paths)[1]
-        (portfolio_date, 
-         self.pricing_portfolio, 
-         strikes, weights)          = self.select_portfolio(time_t, n_paths)
-            
+        (portfolio_date, strikes, weights) = self.select_portfolio(time_t)
+        self.pricing_portfolio = np.zeros((len(strikes), n_paths))
+        
         # Price the Bermudan swaption using the replicating portfolio
-        for count, strike in enumerate(strikes):
-            weight = weights[count]
+        # disc_factors = eval_discount_factors(self.model.n_annual_trading_days, 
+        #                                       self.pricing_r_t_paths, time_t, 
+        #                                       portfolio_date)
+        for count, (strike, weight) in enumerate(zip(strikes, weights)):
+            # if strike <= 0:
+            #     ZBO_pathwise_prices = np.zeros(n_paths)
+            # else:
+            #     # ZBO_pathwise_prices = price_zero_coupon_bond_option_exact(
+            #     #                         self.model.a_param, self.maturity, 
+            #     #                         portfolio_date, 
+            #     #                         self.model.n_annual_trading_days, 
+            #     #                         option_type, None, self.model.sigma, 
+            #     #                         strike, portfolio_date, 
+            #     #                         self.model.time_0_f_curve, 
+            #     #                         self.model.time_0_P_curve, 
+            #     #                         self.units_basis_points, 
+            #     #                         self.pricing_x_t_paths, None)
+            #     ZBO_pathwise_prices = price_zero_coupon_bond_option_exact(
+            #                             self.model.a_param, self.maturity, 
+            #                             portfolio_date, 
+            #                             self.model.n_annual_trading_days, 
+            #                             option_type, None, self.model.sigma, 
+            #                             strike, time_t, 
+            #                             self.model.time_0_f_curve, 
+            #                             self.model.time_0_P_curve, 
+            #                             self.units_basis_points, 
+            #                             self.pricing_x_t_paths, None)
+            # ZBO_pathwise_prices = price_zero_coupon_bond_option_MC(
+            #                             self.model.a_param, self.maturity, 
+            #                             portfolio_date, 
+            #                             self.model.n_annual_trading_days, 
+            #                             option_type, self.pricing_r_t_paths, 
+            #                             self.model.sigma, strike, time_t, 
+            #                             self.model.time_0_f_curve, 
+            #                             self.model.time_0_P_curve, 
+            #                             self.units_basis_points, 
+            #                             self.pricing_x_t_paths, None)
             ZBO_pathwise_prices = price_zero_coupon_bond_option_exact(
-                                        self.model.a_param, self.maturity, 
-                                        portfolio_date, 
-                                        self.model.n_annual_trading_days, 
-                                        option_type, None, self.model.sigma, 
-                                        strike, time_t, 
-                                        self.model.time_0_f_curve, 
-                                        self.model.time_0_P_curve, False, 
-                                        self.pricing_x_t_paths, None)
+                                    self.model.a_param, self.maturity, 
+                                    portfolio_date, 
+                                    self.model.n_annual_trading_days, 
+                                    option_type, None, self.model.sigma, 
+                                    strike, time_t, 
+                                    self.model.time_0_f_curve, 
+                                    self.model.time_0_P_curve, 
+                                    self.units_basis_points, 
+                                    self.pricing_x_t_paths, None)
             
             self.pricing_portfolio[count] = (weight*ZBO_pathwise_prices)
             
-        self.direct_price_estimator = (np.sum(self.pricing_portfolio, 
-                                                        axis=0)
-                                       *10**4/self.notional 
-                                       if self.units_basis_points 
-                                       else np.sum(self.pricing_portfolio, 
-                                                              axis=0))
+        # self.direct_price_estimator = disc_factors*np.sum(self.pricing_portfolio, axis=0)
+        self.direct_price_estimator = np.sum(self.pricing_portfolio, axis=0)
         self.mean_direct_price_estimator = np.mean(self.direct_price_estimator)
         self.se_direct_price_estimator = st.sem(self.direct_price_estimator)
         
-    def eval_EPE_profile(self,
-                       compare: bool,
-                       eval_times: list = None,
-                       r_t_paths: list = None,
-                       units_basis_points: bool = False,
-                       x_t_paths: list = None
-                      ):
+        # # Plot continuation values
+        # time_t_idx = int(time_t*self.model.n_annual_trading_days)
+        # current_x_t = self.pricing_x_t_paths[time_t_idx]
+        # plt.scatter(current_x_t, 
+        #             cashflow_matrix[tenor_idx,itm_path_idxs],
+        #             label='Current Cashflows', marker='x')
+        # plt.scatter(current_x_t, 
+        #             continuation_values, color='black',
+        #          label='Continuation Values', s=1)
+        # plt.xlabel(r'Current $x_t$ for' 
+        #            + r' Monitor Date $T_{fix}$' +f' = {time_T_m}')
+        # plt.ylabel('Value')
+        # plt.title('Least Squares Fit of' 
+        #           + f' {regression_series.capitalize()} Series')
+        # plt.legend(loc='best')
+        # plt.show()
+        # plt.close()
+        
+    def eval_exercise_strategies(self, 
+                                 compare: bool = False,
+                                 plot: bool = False,
+                                 r_t_paths: list = None,
+                                 x_t_paths: list = None
+                                ):
         """
-        Info: this method evaluates the expected positive exposure (EPE) of the 
-            Bermudan swaption using the replicating portfolio.
+        Info: this method evaluates the exercise strategies of the replicating 
+            portfolio.
+        """
+        
+        # Add all but last exercise dates to the evaluation times
+        ex_eval_times = np.linspace(0., self.exercise_dates[-1], 
+                                          num=12*int(self.exercise_dates[-1]))
+        self.ex_eval_times = np.unique(np.concatenate((ex_eval_times, 
+                                                        self.exercise_dates[:-1])))
+            
+        ## Evaluate the exposures
+        if r_t_paths is not None and x_t_paths is not None:
+            self.ex_r_t_paths = r_t_paths
+            self.ex_x_t_paths = x_t_paths
+        else:
+            self.ex_r_t_paths = self.model.r_t_paths[:,self.x_test_idxs]
+            self.ex_x_t_paths = self.model.x_t_paths[:,self.x_test_idxs]
+        n_paths = np.shape(self.ex_x_t_paths)[1]
+        n_eval_times = len(self.ex_eval_times)
+        
+        # Initialize arrays for storing the pathwise exercise strategies
+        self.ex_array = np.zeros((n_eval_times, n_paths))
+        self.live_paths_array = np.ones((len(self.exercise_dates)+1, n_paths), 
+                                        dtype=int)
+        self.pathwise_stopping_times = np.zeros((len(self.exercise_dates), n_paths), 
+                                                dtype=int)
+        
+        T_last_ex = self.exercise_dates[-1]
+        T_last_ex_idx = np.searchsorted(self.tenor_structure, T_last_ex)
+        V_last_ex = price_forward_start_swap(self.model.a_param, 
+                                            self.fixed_rate, 
+                                            self.model.n_annual_trading_days, 
+                                            self.notional, 'swap', 
+                                            False, self.ex_r_t_paths, 
+                                            self.model.sigma, 
+                                            self.swaption_type, 
+                                            self.tenor_structure[T_last_ex_idx:], 
+                                            T_last_ex, 
+                                            self.model.time_0_f_curve, 
+                                            self.model.time_0_P_curve, 
+                                            self.units_basis_points, 
+                                            self.ex_x_t_paths)
+        self.ex_array[-1] = V_last_ex
+        self.pathwise_stopping_times[-1,np.where(V_last_ex>0.)[0]] = 1
+        
+        # Loop over exercise evaluation times and evaluate the strategies
+        for count, eval_time in enumerate(self.ex_eval_times[-2::-1]):
+            rev_count = np.searchsorted(self.ex_eval_times, eval_time)
+            ex_date_idx = np.searchsorted(self.exercise_dates, eval_time)
+            
+            self.price_direct_estimator(eval_time, self.ex_r_t_paths, 
+                                        self.ex_x_t_paths)
+            self.ex_array[rev_count] = np.maximum(self.direct_price_estimator, 
+                                                  0.)
+            
+            if eval_time in self.exercise_dates:
+                tenor_idx = np.searchsorted(self.tenor_structure, eval_time)
+                V_ex_underlying_swap = price_forward_start_swap(self.model.a_param, 
+                                            self.fixed_rate, 
+                                            self.model.n_annual_trading_days, 
+                                            self.notional, 'swap', 
+                                            False, self.ex_r_t_paths, 
+                                            self.model.sigma, 
+                                            self.swaption_type, 
+                                            self.tenor_structure[tenor_idx:], 
+                                            eval_time, 
+                                            self.model.time_0_f_curve, 
+                                            self.model.time_0_P_curve, 
+                                            self.units_basis_points, 
+                                            self.ex_x_t_paths)
+                
+                disc_facts = eval_discount_factors(self.model.n_annual_trading_days, 
+                                                   self.ex_r_t_paths, eval_time, 
+                                                   self.ex_eval_times[rev_count+1])
+                V_cont = disc_facts*self.ex_array[rev_count+1]
+                
+                ex_idxs = np.where(V_ex_underlying_swap>V_cont)
+                self.price_direct_estimator(eval_time, self.ex_r_t_paths, 
+                                            self.ex_x_t_paths)
+                self.ex_array[rev_count,ex_idxs] = self.direct_price_estimator[ex_idxs]
+                self.ex_array[rev_count+1:,ex_idxs] = 0
+                
+                ex_strat_idx = np.searchsorted(self.exercise_dates, eval_time, side='right')
+                self.live_paths_array[ex_strat_idx+1:,ex_idxs] = 0
+                self.pathwise_stopping_times[ex_date_idx,ex_idxs] = 1
+                self.pathwise_stopping_times[ex_date_idx+1:,ex_idxs] = 0
+                
+        # Compare with LSM exercise strategies
+        if compare:
+            self.LSM_instance = BermudanSwaptionLSM(self.model)
+            self.LSM_instance.price_Bermudan_swaption_LSM_Q(2, self.fixed_rate, 
+                                                self.moneyness, self.notional, 
+                                                self.swaption_type, 
+                                                self.tenor_structure, 0., 
+                                                False, self.exercise_dates, 
+                                                'swap', False, False, 'power', 
+                                                self.ex_r_t_paths, 
+                                                self.units_basis_points, 
+                                                self.ex_x_t_paths)
+            
+        # Make a bar plot of the exercise strategies
+        if plot:
+            fig, ax = plt.subplots(1, 1, figsize=(6,4))
+            fig.suptitle(f'{self.tenor_structure_notation} Bermudan {self.swaption_type.capitalize()} ' 
+                         + f'Swaption {int(self.moneyness*100)}% Moneyness' 
+                         + '\nMean Exercise Strategy')
+            bar_offset = .2
+
+            mean_RLNN_live = np.sum(self.live_paths_array, axis=1)
+            SEM_RLNN_live = st.sem(self.live_paths_array, axis=1)
+            mean_RLNN_exercised = np.sum(self.pathwise_stopping_times, axis=1)
+            SEM_RLNN_exercised = st.sem(self.pathwise_stopping_times, axis=1)
+            
+            ax.bar(self.exercise_dates-bar_offset, mean_RLNN_live[1:], 
+                    yerr=1.96*SEM_RLNN_live[1:], width=.4, color='C0', alpha=1., 
+                    label='RLNN\nLive Paths')
+            
+            if compare:
+                mean_LSM_live = np.sum(self.LSM_instance.live_paths_array, axis=1)
+                SEM_LSM_live = st.sem(self.LSM_instance.live_paths_array, axis=1)
+                mean_LSM_exercised = np.sum(self.LSM_instance.pathwise_stopping_times, axis=1)
+                SEM_LSM_exercised = st.sem(self.LSM_instance.pathwise_stopping_times, axis=1)
+                
+                ax.bar(self.exercise_dates+bar_offset, mean_LSM_live[1:],
+                       yerr=1.96*SEM_LSM_live[1:], width=.4, color='C1', alpha=1., 
+                       label='LSM\nLive Paths')
+                ax.bar(self.exercise_dates+bar_offset, mean_LSM_exercised,
+                       yerr=1.96*SEM_LSM_exercised, width=.4, color='black', alpha=.25, hatch='/')
+            
+            ax.bar(self.exercise_dates-bar_offset, mean_RLNN_exercised, 
+                   yerr=1.96*SEM_RLNN_exercised, width=.4, color='black', 
+                   alpha=.25, hatch='/', label='Exercised')
+            ax.set_xlabel('Monitor Date (years)')
+            ax.set_xticks(self.exercise_dates)
+            ax.set_xticklabels((self.exercise_dates.astype(int)).astype(str))
+            ax.set_ylabel('Number of Paths')
+            ax.set_yticklabels(['{:,}'.format(int(y)) for y in ax.get_yticks().tolist()])
+            plt.legend(loc='best')
+            plt.tight_layout()
+
+            plt.show()
+            
+    def eval_EPE_profile(self, 
+                         compare: bool = False,
+                         eval_times: list = None,
+                         r_t_paths: list = None,
+                         units_basis_points: bool = False,
+                         x_t_paths: list = None):
+        """
+        Info: New EPE method
         """
         ## Check whether specific evaluation times were passed
         if eval_times is not None:
+            self.EPE_eval_times = eval_times
+            
             if not isinstance(eval_times, np.ndarray):
                 eval_times = np.array([eval_times])
                 
-            if eval_times[-1] <= self.tenor_structure[-2]:
-                self.EPE_eval_times = eval_times
-            else:
-                raise ValueError('the passed exposure evaluation times may ' 
-                                  + 'not surpass the last monitor date of ' 
-                                  + f'{self.tenor_structure[-2]} years.')
-        # If not, evaluate the EPE biweekly from time zero until the last monitor 
-        # date
+                if eval_times[-1] <= self.exercise_dates[-1]:
+                    self.EPE_eval_times = eval_times
+                else:
+                    raise ValueError('the passed exposure evaluation times may ' 
+                                      + 'not surpass the last exercise date of ' 
+                                      + f'{self.exercise_dates[-1]} years.')
+        # If not, evaluate the EPE biweekly from time zero until the last 
+        # exercise date
         else:
-            self.EPE_eval_times = np.linspace(0., self.tenor_structure[-2], 
-                                              num=24*int(self.tenor_structure[-2])+1)
+            self.EPE_eval_times = np.linspace(0., self.exercise_dates[-1], 
+                                              num=24*int(self.exercise_dates[-1])+1)
             
-        ## Evaluate the exposures
+        # Add all exercise dates to the evaluation times
+        self.EPE_eval_times = np.unique(np.concatenate((self.EPE_eval_times, 
+                                                        self.exercise_dates)))
+        
+        ## Compute the exposures
         if r_t_paths is not None and x_t_paths is not None:
             self.EPE_r_t_paths = r_t_paths
             self.EPE_x_t_paths = x_t_paths
@@ -1576,136 +2019,112 @@ class BermudanSwaptionRLNN:
             self.EPE_x_t_paths = self.model.x_t_paths[:,self.x_test_idxs]
         n_paths = np.shape(self.EPE_x_t_paths)[1]
         n_eval_times = len(self.EPE_eval_times)
+        
+        # Evaluate the exercise strategies if not yet evaluated
+        if not hasattr(self, 'live_paths_array'):
+            self.eval_exercise_strategies(r_t_paths=self.EPE_r_t_paths, 
+                                          x_t_paths=self.EPE_x_t_paths)
             
-        # Evaluate pathwise stopping times
-        self.eval_exercise_strategies(self.EPE_r_t_paths, self.EPE_x_t_paths)
-            
-        # Initialize exposures matrix and mean exposures vector
+        T_last_ex = self.exercise_dates[-1]
+        T_last_ex_tenor_idx = np.searchsorted(self.tenor_structure, T_last_ex)
         self.EPE_RLNN = np.zeros((n_eval_times, n_paths))
-        self.mean_EPE_RLNN = np.zeros(n_eval_times)
-        
-        
-        if compare:
-            LSM_instance = BermudanSwaptionLSM(self.model)
-            self.EPE_LSM = np.zeros_like(self.EPE_RLNN)
-            self.mean_EPE_LSM = np.zeros_like(self.mean_EPE_RLNN)
-        
-        # Loop over EPE evaluation times and evaluate the exposures
-        for count, eval_time in enumerate(self.EPE_eval_times):
-            # print(f'eval_time: {eval_time}')
-            tenor_idx = np.searchsorted(self.tenor_structure, eval_time)
-            print(f'tenor_idx: {tenor_idx}')
-            
-            # print(f'self.live_paths_array[tenor_idx]: {self.live_paths_array[tenor_idx]}')
-            # print(f'non-zero self.live_paths_array[tenor_idx]: {np.nonzero(self.live_paths_array[tenor_idx])}')
-            # print(f'length of non-zero self.live_paths_array[tenor_idx]: {len(np.nonzero(self.live_paths_array[tenor_idx])[0])}')
-            # print(f'mean live_paths_array: {np.mean(self.live_paths_array[tenor_idx])}')
-            
-            # # Method 1:
-            # if eval_time <= self.expiry:
-            #     self.price_direct_estimator(eval_time, self.EPE_r_t_paths, self.EPE_x_t_paths)
-            # else:
-            #     self.price_direct_estimator(self.tenor_structure[tenor_idx], self.EPE_r_t_paths, self.EPE_x_t_paths)
-            # discount_factors = eval_discount_factors(
-            #                                 self.model.n_annual_trading_days, 
-            #                                 self.EPE_r_t_paths, 0., 
-            #                                 self.tenor_structure[tenor_idx])#eval_time)
-            # # print(f'mean discount_factors: {np.mean(discount_factors)}')
-            # self.EPE_RLNN[count] = (discount_factors
-            #                         *self.live_paths_array[tenor_idx]
-            #                         *np.maximum(self.direct_price_estimator, 
-            #                                     0.))
-            
-            # Method 2:
-            discount_factors = eval_discount_factors(
+        V_T_last_underlying_swap = price_forward_start_swap(self.model.a_param, 
+                                            self.fixed_rate, 
                                             self.model.n_annual_trading_days, 
-                                            self.EPE_r_t_paths, 0., eval_time)
-            self.price_direct_estimator(eval_time, self.EPE_r_t_paths, 
-                                        self.EPE_x_t_paths)
-            self.EPE_RLNN[count] = (discount_factors
-                                    *self.live_paths_array[tenor_idx]
-                                    *np.maximum(self.direct_price_estimator, 
-                                                0.))
-            
-            # # Method 3:
-            # if eval_time <= self.expiry:
-            #     self.price_direct_estimator(eval_time, self.EPE_r_t_paths, self.EPE_x_t_paths)
-            # else:
-            #     self.price_direct_estimator(self.tenor_structure[tenor_idx-1], self.EPE_r_t_paths, self.EPE_x_t_paths)
-            # discount_factors = eval_discount_factors(
-            #                                 self.model.n_annual_trading_days, 
-            #                                 self.EPE_r_t_paths, 0., 
-            #                                 self.tenor_structure[tenor_idx])#eval_time)
-            # # print(f'mean discount_factors: {np.mean(discount_factors)}')
-            # self.EPE_RLNN[count] = (discount_factors
-            #                         *self.live_paths_array[tenor_idx]
-            #                         *np.maximum(self.direct_price_estimator, 
-            #                                     0.))
-            
-            # print(f'shape(exposures[count): {np.shape(self.EPE_RLNN[count])}')
-            # print(f'np.shape(self.live_paths_array[tenor_idx]): {np.shape(self.live_paths_array[tenor_idx])}')
-            # print(f'np.shape(self.direct_price_estimator): {np.shape(self.direct_price_estimator)}')
-            # self.EPE_RLNN[count] = self.direct_price_estimator
-            # print(f'mean price: {np.mean(self.direct_price_estimator)}')
-            self.mean_EPE_RLNN[count] = np.mean(self.EPE_RLNN[count])
-            # self.mean_EPE_RLNN[count] = (1#np.mean(discount_factors)
-            #                               *np.mean(self.live_paths_array[tenor_idx])
-            #                               *np.mean(self.direct_price_estimator))
-            # print(f'mean exposure: {self.mean_EPE_RLNN[count]}')
-            # print('directly evaluated mean exposure: '
-            #       + f'{np.mean(discount_factors)*np.mean(self.live_paths_array[tenor_idx])*np.mean(self.direct_price_estimator)}')
-            
-            # print(f'discount_factors[:10]: {discount_factors[:10]}')
-            # print(f'live_paths_array[:10]: {self.live_paths_array[tenor_idx][:10]}')
-            # print(f'direct_price_estimator[:10]: {self.direct_price_estimator[:10]}')
-            
-            if compare:
-                LSM_instance.price_Bermudan_swaption_LSM_Q(2, self.fixed_rate, 
-                                            self.moneyness, self.notional, 
+                                            self.notional, 'swap', 
+                                            False, self.EPE_r_t_paths, 
+                                            self.model.sigma, 
                                             self.swaption_type, 
-                                            self.tenor_structure, eval_time, 
+                                            self.tenor_structure[T_last_ex_tenor_idx:], 
+                                            T_last_ex, 
+                                            self.model.time_0_f_curve, 
+                                            self.model.time_0_P_curve, 
                                             self.units_basis_points, 
-                                            'swap', False, False, 
-                                            'power', self.EPE_r_t_paths, False, 
                                             self.EPE_x_t_paths)
-                pathwise_LSM_prices = LSM_instance.pathwise_LSM_prices
-                LSM_live_paths = LSM_instance.live_paths_array[0]
-                
-                LSM_instance.price_Bermudan_swaption_LSM_Q(2, self.fixed_rate, 
-                                            self.moneyness, self.notional, 
-                                            self.swaption_type, 
-                                            self.tenor_structure, self.tenor_structure[tenor_idx+2], 
-                                            self.units_basis_points, 
-                                            'swap', False, False, 
-                                            'power', self.EPE_r_t_paths, False, 
-                                            self.EPE_x_t_paths)
-                future_LSM_prices = LSM_instance.pathwise_LSM_prices
-                disc_cont_LSM = (eval_discount_factors(self.model.n_annual_trading_days, 
-                                                      self.EPE_r_t_paths, eval_time, 
-                                                      self.tenor_structure[tenor_idx])
-                                 *future_LSM_prices)
-                current_ex = np.maximum(price_forward_start_swap(
-                    self.model.a_param, self.fixed_rate, 
-                    self.model.n_annual_trading_days, 
-                    self.notional, 'swap', 
-                    False, self.EPE_r_t_paths, self.model.sigma, 
-                    self.swaption_type, self.tenor_structure[tenor_idx+1:], 
-                    eval_time, self.model.time_0_f_curve, 
-                    self.model.time_0_P_curve, self.units_basis_points, 
-                    self.EPE_x_t_paths), 0)
-                print(f'np.mean(current_ex): {np.mean(current_ex)}')
-                print(f'np.mean(disc_cont_LSM): {np.mean(disc_cont_LSM)}')
-                LSM_live_paths = np.zeros(n_paths)
-                itm_idxs = np.where(current_ex>disc_cont_LSM)[0]
-                LSM_live_paths[itm_idxs] = 1
-                print(f'LSM_live_paths: {LSM_live_paths}')
-                print(f'len(LSM_live_paths): {len(LSM_live_paths)}')
-                
-                self.EPE_LSM[count] = (discount_factors*LSM_live_paths
-                                       *np.maximum(pathwise_LSM_prices, 0))
-                self.mean_EPE_LSM[count] = np.mean(self.EPE_LSM[count])
-            
+        self.EPE_RLNN[-1] = np.maximum(V_T_last_underlying_swap, 0.)
         
+        # self.price_direct_estimator(self.exercise_dates[-1], self.EPE_r_t_paths, 
+        #                             self.EPE_x_t_paths)
+        # self.EPE_RLNN[-1] = self.direct_price_estimator
+        # print(f'FINAL RLNN EPE: {np.mean(self.EPE_RLNN[-1])}')
+        
+        
+        
+        for count, eval_time in enumerate(self.EPE_eval_times[-2::-1]):
+            rev_count = n_eval_times - 2 - count
+            # self.price_direct_estimator(eval_time, self.EPE_r_t_paths, 
+            #                             self.EPE_x_t_paths)
+            # self.EPE_RLNN[rev_count] = self.direct_price_estimator
+            
+            # ex_date_idx = np.searchsorted(self.exercise_dates, eval_time, 
+            #                               side='right')
+            # self.price_direct_estimator(self.exercise_dates[ex_date_idx], 
+            #                             self.EPE_r_t_paths, self.EPE_x_t_paths)
+            # disc_factors = eval_discount_factors(self.model.n_annual_trading_days, 
+            #                                      self.EPE_r_t_paths, eval_time, 
+            #                                      self.exercise_dates[ex_date_idx])
+            # self.EPE_RLNN[rev_count] = disc_factors*self.direct_price_estimator
+            
+            # disc_factors = eval_discount_factors(self.model.n_annual_trading_days, 
+            #                                       self.EPE_r_t_paths, eval_time, 
+            #                                       self.EPE_eval_times[rev_count+1])
+            # self.EPE_RLNN[rev_count] = disc_factors*self.EPE_RLNN[rev_count+1]
+            
+            if eval_time in self.exercise_dates:
+                self.price_direct_estimator(eval_time, self.EPE_r_t_paths, 
+                                            self.EPE_x_t_paths)
+                self.EPE_RLNN[rev_count] = self.direct_price_estimator
+            
+        # Adjust for Monte Carlo path live status
+        for count, eval_time in enumerate(self.EPE_eval_times):
+            ex_strat_idx = np.searchsorted(self.tenor_structure, eval_time, side='right')
+            # print(f'eval_time, ex_strat_idx: {eval_time, ex_strat_idx}')
+            self.EPE_RLNN[count] = (self.live_paths_array[ex_strat_idx]
+                                        *self.EPE_RLNN[count])
+            
+        for count, eval_time in enumerate(self.EPE_eval_times[-2::-1]):
+            rev_count = n_eval_times - 2 - count
+            
+            if not eval_time in self.exercise_dates:
+                disc_factors = eval_discount_factors(self.model.n_annual_trading_days, 
+                                                      self.EPE_r_t_paths, eval_time, 
+                                                      self.EPE_eval_times[rev_count+1])
+                self.EPE_RLNN[rev_count] = disc_factors*self.EPE_RLNN[rev_count+1]
+            
+        for count, eval_time in enumerate(self.EPE_eval_times):
+            disc_factors = eval_discount_factors(self.model.n_annual_trading_days, 
+                                                 self.EPE_r_t_paths, 0., 
+                                                 eval_time)
+            self.EPE_RLNN[count] = disc_factors*self.EPE_RLNN[count]
+            
+        self.mean_EPE_RLNN = np.mean(self.EPE_RLNN, axis=1)
+            
+        # Evaluate LSM EPE profile if selected
+        if compare:
+            self.LSM_instance = BermudanSwaptionLSM(self.model)
+            self.LSM_instance.price_Bermudan_swaption_LSM_Q(2, self.fixed_rate, 
+                                                self.moneyness, self.notional, 
+                                                self.swaption_type, 
+                                                self.tenor_structure, 0., 
+                                                False, self.exercise_dates, 
+                                                'swap', False, False, 'power', 
+                                                self.EPE_r_t_paths, 
+                                                self.units_basis_points, 
+                                                self.EPE_x_t_paths)
+            self.LSM_instance.eval_EPE_profile(self.EPE_eval_times, 
+                                          self.EPE_r_t_paths, 
+                                          self.EPE_x_t_paths)
+            self.EPE_LSM = self.LSM_instance.EPE_LSM
+            self.mean_EPE_LSM = np.mean(self.EPE_LSM, axis=1)
+            
+            # # OLDDDDDDDD
+            # self.LSM_instance.eval_EPE_profile2(True, self.EPE_eval_times, 
+            #                                     self.EPE_r_t_paths, 
+            #                                     self.units_basis_points, 
+            #                                     self.EPE_x_t_paths)
+            # self.EPE_LSM = self.LSM_instance.EPE_LSM
+            # self.mean_EPE_LSM = np.mean(self.EPE_LSM)
+            
     def plot_EPE_profile(self, 
                          plot: str,
                          save_plot: bool = True,
@@ -1726,6 +2145,12 @@ class BermudanSwaptionRLNN:
                      + f'Bermudan {self.swaption_type.capitalize()} ' 
                      + 'Swaption\n' 
                      + f'{int(self.moneyness*100)}% Moneyness')
+        if not np.array_equal(self.exercise_dates, self.monitor_dates):
+            plt.suptitle('Expected Positive Exposure Profile of\n' 
+                         + f'{self.tenor_structure_notation} ' 
+                         + f'Bermudan {self.swaption_type.capitalize()} ' 
+                         + f'Swaption\nExercise Dates: {self.exercise_dates}, ' 
+                         + f'{int(self.moneyness*100)}% Moneyness')
         
         # Adjust plotting if data is in absolute units but plotting 
         # must be in basis points of the notional
@@ -1750,14 +2175,24 @@ class BermudanSwaptionRLNN:
                    label='Replicating\nPortfolio', color='C0', linestyle='solid')
             ax.plot(self.EPE_eval_times, np.mean(self.EPE_LSM, axis=1)*adjust_units, 
                    label='LSM', color='C1', linestyle='dashed')
-            ax.fill_between(self.EPE_eval_times, 
-                            (np.mean(self.EPE_RLNN, axis=1) 
-                              + 1.96*st.sem(self.EPE_RLNN, axis=1))
-                            *adjust_units, 
-                            (np.mean(self.EPE_RLNN, axis=1)
-                              - 1.96*st.sem(self.EPE_RLNN, axis=1))
-                            *adjust_units, color='C0',
-                            alpha=.5)
+            if np.array_equal(self.exercise_dates, [self.tenor_structure[0]]):
+                ax.fill_between(self.EPE_eval_times, 
+                                (np.mean(self.EPE_RLNN, axis=1) 
+                                  + 1.96*st.sem(self.EPE_RLNN, axis=1))
+                                *adjust_units, 
+                                (np.mean(self.EPE_RLNN, axis=1)
+                                  - 1.96*st.sem(self.EPE_RLNN, axis=1))
+                                *adjust_units, color='C0', label='95% C.I.', 
+                                alpha=.5)
+            else:
+                ax.fill_between(self.EPE_eval_times, 
+                                (np.mean(self.EPE_RLNN, axis=1) 
+                                  + 1.96*st.sem(self.EPE_RLNN, axis=1))
+                                *adjust_units, 
+                                (np.mean(self.EPE_RLNN, axis=1)
+                                  - 1.96*st.sem(self.EPE_RLNN, axis=1))
+                                *adjust_units, color='C0', 
+                                alpha=.5)
             ax.fill_between(self.EPE_eval_times, 
                             (np.mean(self.EPE_LSM, axis=1) 
                               + 1.96*st.sem(self.EPE_LSM, axis=1))
@@ -1961,7 +2396,6 @@ class BermudanSwaptionRLNN:
         """
         Info: Currenly implemented for time-zero Deltas only...
         """
-        print(f'RLNN n_eval_times: {len(eval_times)}')
         ISDA_SIMM_tenors = np.array(list(self.model.ISDA_SIMM_tenors_dict.values()))
         self.bump_size = bump_size
         
@@ -1976,10 +2410,12 @@ class BermudanSwaptionRLNN:
                              + 'process paths for determination of ' 
                              + 'pathwise stopping times')
         elif r_t_paths is None and x_t_paths is None:
-            r_t_paths = self.model.r_t_paths[:,self.x_test_idxs]
-            x_t_paths = self.model.x_t_paths[:,self.x_test_idxs]
+            self.sens_r_t_paths = self.model.r_t_paths[:,self.x_test_idxs]
+            self.sens_x_t_paths = self.model.x_t_paths[:,self.x_test_idxs]
             n_paths = self.n_test
         else:
+            self.sens_r_t_paths = r_t_paths
+            self.sens_x_t_paths = x_t_paths
             n_paths = np.shape(x_t_paths)[1]
             
         # Check whether tenor time(s) passed as string or float(s)
@@ -2030,8 +2466,9 @@ class BermudanSwaptionRLNN:
         self.dVdR = np.zeros((n_eval_times, n_Delta_tenors, n_paths))
         
         # Check whether exercise strategies have already been evaluated
-        if not hasattr(self, 'pathwise_stopping_times'):
-            self.eval_exercise_strategies(r_t_paths, x_t_paths)
+        if not hasattr(self, 'live_paths_array'):
+            self.eval_exercise_strategies(r_t_paths=self.sens_r_t_paths, 
+                                          x_t_paths=self.sens_x_t_paths)
 
         ## Compute forward deltas
         # Loop over evaluation times
@@ -2041,25 +2478,25 @@ class BermudanSwaptionRLNN:
             
             # Select the portfolio that replicates the Bermudan swaption at 
             # the current evaluation time along with the strikes and weights
-            (portfolio_date, __, 
-             strikes, weights)      = self.select_portfolio(eval_time, n_paths)
-            portfolio_count = np.searchsorted(self.monitor_dates, eval_time)
+            (portfolio_date, strikes, weights) = self.select_portfolio(eval_time)
             
             t_idx = int(eval_time*self.model.n_annual_trading_days)
             P_t_m = price_zero_coupon_bond(self.model.a_param, 
                                             self.model.n_annual_trading_days, 
-                                            r_t_paths[t_idx], self.model.sigma, 
-                                            eval_time, portfolio_date, 
+                                            self.sens_r_t_paths[t_idx], 
+                                            self.model.sigma, eval_time, 
+                                            portfolio_date, 
                                             self.model.time_0_f_curve, 
                                             self.model.time_0_P_curve, 
-                                            x_t_paths[t_idx])
+                                            self.sens_x_t_paths[t_idx])
             P_t_M = price_zero_coupon_bond(self.model.a_param, 
                                             self.model.n_annual_trading_days, 
-                                            r_t_paths[t_idx], self.model.sigma, 
-                                            eval_time, self.maturity, 
+                                            self.sens_r_t_paths[t_idx], 
+                                            self.model.sigma, eval_time, 
+                                            self.maturity, 
                                             self.model.time_0_f_curve, 
                                             self.model.time_0_P_curve, 
-                                            x_t_paths[t_idx])
+                                            self.sens_x_t_paths[t_idx])
 
             # Loop over tenors
             for tenor_count, tenor in enumerate(self.Delta_tenors):
@@ -2071,6 +2508,7 @@ class BermudanSwaptionRLNN:
                 
                 # Evaluate P_t_m
                 tau_m = portfolio_date - eval_time
+                # print(f'tau_m = portfolio_date - eval_time: {tau_m}')
                 
                 if tau_m in ISDA_SIMM_tenors:
                     if tenor == tau_m:
@@ -2101,8 +2539,9 @@ class BermudanSwaptionRLNN:
                     
                 ## Evaluate the dVdR_k vector with k the current ISDA-SIMM 
                 ## tenor
-                
                 dVdR_k = np.zeros((len(strikes), n_paths))
+                portfolio_count = np.searchsorted(self.exercise_dates, 
+                                                  eval_time, side='right')
                 
                 for strike_count, strike in enumerate(strikes):
                     weight = weights[strike_count]
@@ -2260,10 +2699,10 @@ class BermudanSwaptionRLNN:
         if plot.lower() == 'rlnn':
             fig, ax = plt.subplots()
             plt.suptitle(r'$\frac{\partial \hat{{V}}}{\partial R_k}$ of ' 
-                         + 'Replicating Portfolio of\n'
+                         + 'Replicating Portfolio of '
                          + f'{self.tenor_structure_notation} ' 
-                         + f'Bermudan {self.swaption_type.capitalize()} ' 
-                         + f'Swaption ({int(self.moneyness*100)}% Moneyness)')
+                         + f'Bermudan\n{self.swaption_type.capitalize()} ' 
+                         + f'Swaption at {int(self.moneyness*100)}% Moneyness')
             line_styles = ['dotted', 'solid', 'dashed']
             n_repeats = 4
 
@@ -2320,121 +2759,30 @@ class BermudanSwaptionRLNN:
             
             plt.show()
     
-    
-    def eval_exercise_strategies(self,
-                                 r_t_paths: list = None,
-                                 x_t_paths: list = None
-                                ):
-        """
-        Info: this methode valuates the optimal pathwise stopping times of the 
-            Bermudan swaption.
-        """
-        if r_t_paths is None and x_t_paths is not None:
-            raise ValueError('pass corresponding short rate and zero-mean ' 
-                             + 'process paths for determination of ' 
-                             + 'pathwise stopping times')
-        elif r_t_paths is not None and x_t_paths is None:
-            raise ValueError('pass corresponding short rate and zero-mean ' 
-                             + 'process paths for determination of ' 
-                             + 'pathwise stopping times')
-        elif r_t_paths is None and x_t_paths is None:
-            eval_r_t_paths = self.model.r_t_paths[:,self.x_test_idxs]
-            eval_x_t_paths = self.model.x_t_paths[:,self.x_test_idxs]
-            n_paths = self.n_test
-        else:
-            # print(np.shape(x_t_paths))
-            n_paths = np.shape(x_t_paths)[1]
-            eval_r_t_paths = r_t_paths
-            eval_x_t_paths = x_t_paths
-            
-        # Evaluate the replicating portfolio price on each monitor date before 
-        # the last. The continuation value at the last monitor date is zero
-        eval_times = self.monitor_dates
-        n_eval_times = len(eval_times)
-        
-        # Construct pathwise stopping times matrix
-        self.live_paths_array = np.ones((n_eval_times, n_paths), 
-                                                  dtype=int)
-
-        self.pathwise_stopping_times = np.zeros_like(self.live_paths_array, 
-                                                 dtype=int)
-        
-        for count, eval_time in enumerate(eval_times[-1::-1]):
-            rev_count = n_eval_times - count - 1
-            print(f'rev_count: {rev_count}')
-            print(f'eval_time: {eval_time}')
-            print(f'eval_times[rev_count]: {eval_times[rev_count]}')
-            print(f'self.tenor_structure[rev_count:]: {self.tenor_structure[rev_count:]}')
-            
-            ## Evaluate discounted continuation value at current evaluation 
-            ## date
-            if count == 0:
-                disc_V_continuation = np.zeros(n_paths)
-            else:
-                self.price_direct_estimator(eval_times[rev_count+1], 
-                                            eval_r_t_paths, eval_x_t_paths)
-                discount_factors = eval_discount_factors(
-                                            self.model.n_annual_trading_days, 
-                                            eval_r_t_paths, eval_time, 
-                                            eval_times[rev_count+1])
-                disc_V_continuation = np.maximum(discount_factors
-                                                 *self.direct_price_estimator, 
-                                                 0)
-            
-            ## Evaluate exercise value at current evaluation date
-            V_exercise = np.maximum(price_forward_start_swap(
-                                    self.model.a_param, self.fixed_rate, 
-                                    self.model.n_annual_trading_days, 
-                                    self.notional, 'swap', False, None, 
-                                    self.model.sigma, self.swaption_type, 
-                                    self.tenor_structure[rev_count:], 
-                                    eval_time, self.model.time_0_f_curve, 
-                                    self.model.time_0_P_curve, 
-                                    self.units_basis_points, eval_x_t_paths), 
-                                    0)
-            
-            exercise_idxs = np.where(V_exercise>disc_V_continuation)[0]
-            self.pathwise_stopping_times[rev_count,exercise_idxs] = 1
-            self.pathwise_stopping_times[rev_count+1:,exercise_idxs] = 0
-            # print(f'exercise_idxs: {exercise_idxs}')
-            # print(f'Number of exercised paths: {len(exercise_idxs)}')
-            self.live_paths_array[rev_count+1:,exercise_idxs] = 0
-            
-            # print(f'current live_paths_array: {self.live_paths_array[:,:10]}')
-            
-            # print(f'live_paths_array: {self.live_paths_array[:,:10]}')
-            
-        # print('number of paths with multiple stopping times: ' 
-        #       + f'{np.nonzero(np.where(self.live_paths_array[0]+self.live_paths_array[1]+self.live_paths_array[2]+self.live_paths_array[3]+self.live_paths_array[4]>np.ones(n_paths),1,0))}')
-        
-        # print(f'Number of exercised paths: {len(self.live_paths_array[self.live_paths_array!=0.])}')
-        
-        # unexercised_idxs = np.where(self.live_paths_array[-1,:]>0)[0]
-        # self.live_paths_array[:,unexercised_idxs] = 0
-        
-    
     def select_portfolio(self, 
-                         eval_time: float,
-                         n_paths: int
+                         eval_time: float
                         ):
         """
         Info: this method selects the replicating zero-coupon bond option 
             portfolio that corresponds to the specified evaluation time. 
-            Specifically, it returns the portfolio weights, strikes, date, 
-            and a zero-initialized numpy array for use in the evaluation of 
-            the Bermudan swaption price.
+            Specifically, it returns the portfolio replication date, portfolio 
+            weights, and portfolio strikes.
         """
             
-        for count, monitor_date in enumerate(self.monitor_dates):
-            if eval_time <= monitor_date:
-                portfolio_date = monitor_date
-                strikes = self.ZBO_portfolio_strikes_list[count]
-                weights = self.ZBO_portfolio_weights_list[count]
-                replicating_portfolio = np.zeros((len(weights), n_paths))
+        # for count, monitor_date in enumerate(self.monitor_dates):
+        #     if eval_time <= monitor_date:
+        #         portfolio_date = monitor_date
+        #         strikes = self.ZBO_portfolio_strikes_list[count]
+        #         weights = self.ZBO_portfolio_weights_list[count]
                 
-                break
+        #         break
+    
+        ex_date_idx = np.searchsorted(self.exercise_dates, eval_time)
+        portfolio_date = self.exercise_dates[ex_date_idx]
+        strikes = self.ZBO_portfolio_strikes_list[ex_date_idx]
+        weights = self.ZBO_portfolio_weights_list[ex_date_idx]
                 
-        return portfolio_date, replicating_portfolio, strikes, weights
+        return portfolio_date, strikes, weights
     
     def visualize_neural_network(self, 
                                  file_name: str

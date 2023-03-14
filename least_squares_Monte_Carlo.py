@@ -306,6 +306,593 @@ def price_Bermudan_swaption_LSM_Q(a_param: float,
                                   time_0_P_curve: list, 
                                   units_basis_points: bool,
                                   x_t_paths: list,
+                                  exercise_dates: list = None,
+                                  verbose: bool = False
+                                 ) -> list:
+    """
+    Info: This function computes the Least Squares Monte Carlo (LSM) price of 
+        a Bermudan swaption using the One-Factor Hull & White (1F-HW) short 
+        rate model under the risk-neutral measure Q.
+        
+    Input: 
+        a_param: a float specifying the constant mean reversion rate parameter 
+            in the 1F-HW short rate model.
+            
+        degree: an int specifying the degree of the polynomial used in the 
+            regression.
+            
+        experiment_dir: the directory to which the results are saved.
+        
+        fixed_rate: a float specifying the fixed interest rate used as the 
+            strike rate of the (underlying) interest rate swap.
+            
+        moneyness: a float specifying the level of moneyness e.g. 1.0 equals 
+            100% moneyness.
+            
+        n_annual_trading_days: an int specifying the number of trading days 
+            per year for the time axis discretization.
+            
+        notional: a float specifying the notional amount of the (underlying) 
+            interest rate swap.
+            
+        payoff_var: a str specifying the (underlying) swap payoff function: if 
+            'swap', the swap payoff is determined using the forward swap rate; 
+            if 'forward', the swap payoff is determined using the simply 
+            compounded forward rate.
+            
+        plot_regression: a bool which if True plots the regression at a select 
+            number of intermediate time steps.
+            
+        plot_timeline: a bool specifying whether or not the (underlying) swap 
+            timeline is plotted and saved to the local folder.
+            
+        regression_series: a str specifying the polynomial type used in the 
+            regression which can be either 'LaGuerre' or 'power'.
+            
+        r_t_paths: a 2D ndarray containing the simulated short rate paths along 
+            a number of columns corresponding to the number of paths and a 
+            number of rows being a discrete short rate time series of length 
+            equal to the total number of trading days.
+            
+        sigma: a float specifying the constant volatility factor in the 
+            1F-HW short rate model.
+            
+        swaption_type: a str specifying the swaption type which can be 
+            'payer' or 'receiver'.
+            
+        tenor_structure: a list containing the (underlying) forward swap's 
+            starting date as the first entry and the payment dates as the 
+            remaining entries.
+            
+        time_t: a float specifying the time of evaluation in years.
+        
+        time_0_dfdt_curve: an ndarray containing the time derivative values of 
+            the time-zero instantaneous forward curve.
+            
+        time_0_f_curve: an ndarray containing the time values of the market 
+            time-zero instantaneous forward curve.
+            
+        time_0_P_curve: an ndarray containing the time values of the market 
+            time-zero zero-bond curve.
+        
+        units_basis_points: a bool which if True causes the output value to be 
+            given in basis points of the notional.
+            
+        verbose: a bool which if False blocks the function prints.
+            
+        x_t_paths: a 2D ndarray containing the zero-mean process paths along 
+            a number of columns corresponding to the number of paths and a 
+            number of rows being a discrete short rate time series of length 
+            equal to the total number of trading days.
+        
+    Output: 
+        swaption_price_vector: a 1D ndarray containing the pathwise LSM prices 
+            of the Bermudan swaption.
+            
+        live_paths_array: a 2D ndarray containing the live status of the 
+            Monte Carlo paths on the monitor dates.
+            
+        pathwise_stopping_times: 2 2D ndarray containing the pathwise stopping 
+            times of the Bermudan swaption.
+    """
+    # Check whether Data directory located in current directory and if not, 
+    # create Data directory
+    data_dir = os.path.join(experiment_dir, 'Data\\')
+
+    if not os.path.isdir(data_dir):
+        os.makedirs(data_dir)
+    
+    # Check whether swaption type was specified correctly and assign the delta 
+    # parameter of the payoff function
+    if (swaption_type.lower() != 'payer' 
+        and swaption_type.lower() != 'receiver'):
+        raise ValueError('forward-start swaption type not detected. Enter as ' 
+                         + '"payer" or "receiver"')
+        
+    # Check whether short rate paths and/or zero-mean path were passed
+    if x_t_paths is None:
+        raise ValueError('no zero-mean process paths were passed.')
+        
+    # If specified, compute the moneyness-adjusted fixed rate
+    if moneyness is not None:
+        fixed_rate = eval_moneyness_adjusted_fixed_rate(moneyness, 
+                                                        n_annual_trading_days, 
+                                                        swaption_type, 
+                                                        tenor_structure, 
+                                                        time_0_P_curve)
+    
+    # Check whether the payoff function type was specified correctly
+    if payoff_var.lower() != 'swap' and payoff_var.lower() != 'forward':
+        raise ValueError('no swaption payoff variable was specified.' 
+                         + ' Enter as "swap" or "forward".')
+        
+    ## Adjust the exercise date depending on the pricing time
+    # time_t_idx = np.searchsorted(exercise_dates, time_t)
+    # print(f'time_t_idx: {time_t_idx}')
+    # exercise_dates = exercise_dates[time_t_idx:]
+    # print(f'exercise_dates: {exercise_dates}')
+    n_exercise = len(exercise_dates)
+    # print(f'n_exercise: {n_exercise}')
+    
+    # # Determine the monitor dates that are relevant at the pricing time and 
+    # # adjust the tenor structure accordingly
+    # first_monitor_date_idx = np.searchsorted(tenor_structure, time_t)
+    # print(f'time_t: {time_t}')
+    # print(f'first_monitor_date_idx: {first_monitor_date_idx}')
+    # tenor_structure = tenor_structure[first_monitor_date_idx:]
+    
+    # Evaluate the number of paths and the tenor
+    n_paths = r_t_paths.shape[1]
+    tenor = len(tenor_structure)
+    
+    ## Evaluate the option payoff and cashflow matrices. The payoff matrix will 
+    ## remain unchanged throughout the algorithm while the cashflow matrix will 
+    ## be altered as the option is either exercised or held at various time 
+    ## points
+    
+    # Initialize arrays for storing the pathwise payoffs
+    payoff_matrix = np.zeros((n_exercise, n_paths))
+    live_paths_array = np.ones((n_exercise+1, n_paths), dtype=int)
+    pathwise_stopping_times = np.zeros((n_exercise, n_paths), dtype=int)
+    
+    # Iterate over the monitor dates and evaluate the corresponding payoffs 
+    # and discount factors
+    for count, time_T_m in enumerate(exercise_dates):
+        # Evaluate pathwise zero-coupon bond prices from current monitor date 
+        # T_current to the final payment date T_M for evaluating the 
+        # swaption payoff
+        if verbose:
+            print(f'Evaluating pay-off matrix at T = {time_T_m}')
+        
+        ex_date_idx = np.searchsorted(exercise_dates, time_T_m)
+        payoff_matrix[count] = np.maximum(price_forward_start_swap(a_param, 
+                                        fixed_rate, n_annual_trading_days, 
+                                        notional, payoff_var, plot_timeline, 
+                                        r_t_paths, sigma, swaption_type, 
+                                        tenor_structure[ex_date_idx:], time_T_m, 
+                                        time_0_f_curve, time_0_P_curve, units_basis_points, 
+                                        x_t_paths, verbose), 0.)
+    
+    # Evaluate the cashflow matrix which is initialized as the payoff at the 
+    # final monitor date discounted back to the previous monitor dates
+    cashflow_matrix = np.zeros((n_exercise, n_paths))
+    cashflow_matrix[-1] = payoff_matrix[-1]
+    pathwise_stopping_times[-1,np.where(payoff_matrix[-1]>0.)[0]] = 1
+    
+    ## Apply the LSM algorithm in order to find the optimal stopping times
+    # Iterate backward over the exercise dates excluding the last one if it 
+    # corresponds to the last monitor date
+    # for count, time_T_m in (enumerate(exercise_dates[-2::-1]) 
+    #                         if np.array_equal(exercise_dates, tenor_structure) 
+    #                         else enumerate(exercise_dates[::-1])):
+    if n_exercise == 1:
+        # Determine the indices corresponding to the current monitor date in 
+        # the tenor_structure vector and the payment date in the short rate 
+        # matrix
+        time_T_m = exercise_dates[0]
+        T_current_idx = int(time_T_m*n_annual_trading_days)
+        tenor_idx = np.searchsorted(tenor_structure, time_T_m)
+        # print(f'tenor_idx: {tenor_idx}')
+        # print(f'exercise_dates[tenor_idx]: {exercise_dates[tenor_idx]}')
+        
+        # Select the cashflows corresponding to the current monitor dates
+        current_exercise = payoff_matrix[tenor_idx]
+        
+        # Determine the indices of the short rate paths for which the swaption 
+        # is in-the-money at the current monitor date T_current and store the 
+        # scorresponding short rate values in array their array
+        itm_path_idxs = np.nonzero(current_exercise)[0]
+        current_x_t = x_t_paths[T_current_idx,itm_path_idxs]
+        
+        discounted_future_cashflows = np.zeros_like(itm_path_idxs)
+        
+        # Proceed if at least one path is in-the-money
+        if not itm_path_idxs.size == 0:
+            if regression_series.lower() == 'laguerre':
+                # Determine the conditional expectation function by regressing 
+                # the discounted future cashflows on the current short rate 
+                # values using Laguerre polynomials
+                cond_exp_func = np.polynomial.laguerre.lagfit(
+                                                current_x_t, 
+                                                discounted_future_cashflows, 
+                                                degree)
+                
+                # Evaluate the continuation values
+                continuation_values = np.polynomial.laguerre.lagval(
+                                                        current_x_t, 
+                                                        cond_exp_func)
+            elif regression_series.lower() == 'power':
+                # Determine the conditional expectation function by regressing 
+                # the discounted future cashflows on the current short rate 
+                # values using power series
+                cond_exp_func = np.polynomial.polynomial.polyfit(
+                                                current_x_t, 
+                                                discounted_future_cashflows, 
+                                                degree)
+                # Evaluate the continuation values
+                continuation_values = np.polynomial.polynomial.polyval(
+                                                        current_x_t, 
+                                                        cond_exp_func)
+            else:
+                raise ValueError('regression series not recognized.' 
+                                 + ' Enter as "Laguerre" or "power".')
+            # print(f'cond_exp_func: {cond_exp_func}')
+            
+            cashflow_matrix[tenor_idx,
+                            itm_path_idxs] = np.where(current_exercise[itm_path_idxs] 
+                                                      > continuation_values, 
+                                                      current_exercise[itm_path_idxs], 
+                                                      cashflow_matrix[tenor_idx,itm_path_idxs])
+            
+            # Determine the indices of the paths that were exercised in order 
+            # to set all their future cashflows to zero
+            exercised_itm_indices = itm_path_idxs[np.where(current_exercise[itm_path_idxs] 
+                                                           > continuation_values)]
+            cashflow_matrix[tenor_idx+1:,exercised_itm_indices] = 0
+            
+            # Plot the regression for each monitor date if selected by user
+            if plot_regression == True:
+                plt.scatter(current_x_t, 
+                            payoff_matrix[tenor_idx,itm_path_idxs],
+                            label='Current Exercise', marker='x')
+                plt.scatter(current_x_t, 
+                            continuation_values, color='black',
+                         label='Continuation Values', s=1)
+                plt.xlabel(r'Current $x_t$ for' 
+                           + r' Monitor Date $T_{fix}$' +f' = {exercise_dates[0]}')
+                plt.ylabel('Value')
+                plt.title('Least Squares Fit of' 
+                          + f' {regression_series.capitalize()} Series')
+                plt.legend(loc='best')
+                plt.show()
+                plt.close()
+        
+    else:
+        for count, time_T_m in enumerate(exercise_dates[-2::-1]):
+            
+            # Determine the indices corresponding to the current monitor date in 
+            # the tenor_structure vector and the payment date in the short rate 
+            # matrix
+            T_current_idx = int(time_T_m*n_annual_trading_days)
+            ex_date_idx = np.searchsorted(exercise_dates, time_T_m)
+            # print(f'exercise_dates[ex_date_idx]: {exercise_dates[ex_date_idx]}')
+            # print(f'ex_date_idx: {ex_date_idx}')
+            
+            time_T_m_next = exercise_dates[ex_date_idx+1]
+            discount_factors = eval_discount_factors(n_annual_trading_days, 
+                                                      r_t_paths, time_T_m, 
+                                                      time_T_m_next)
+            cashflow_matrix[ex_date_idx] = discount_factors*cashflow_matrix[ex_date_idx+1]
+            
+            # Select the cashflows corresponding to the current monitor dates
+            current_exercise = payoff_matrix[ex_date_idx]
+            
+            # Determine the indices of the short rate paths for which the swaption 
+            # is in-the-money at the current monitor date T_current and store the 
+            # scorresponding short rate values in array their array
+            itm_path_idxs = np.nonzero(current_exercise)[0]
+            current_x_t_itm = x_t_paths[T_current_idx,itm_path_idxs]
+            
+            # Initialize array for storing the discounted future cashflows for each 
+            # currently in-the-money short rate path
+            discounted_future_cashflows = cashflow_matrix[ex_date_idx,itm_path_idxs]
+            
+            # Proceed if at least one path is in-the-money
+            if not itm_path_idxs.size == 0:
+                if regression_series.lower() == 'laguerre':
+                    # Determine the conditional expectation function by regressing 
+                    # the discounted future cashflows on the current zero mean process
+                    # values using Laguerre polynomials
+                    cond_exp_func = np.polynomial.laguerre.lagfit(
+                                                    current_x_t_itm, 
+                                                    discounted_future_cashflows, 
+                                                    degree)
+                    
+                    # Evaluate the continuation values
+                    continuation_values = np.polynomial.laguerre.lagval(
+                                                            current_x_t_itm, 
+                                                            cond_exp_func)
+                elif regression_series.lower() == 'power':
+                    # Determine the conditional expectation function by regressing 
+                    # the discounted future cashflows on the current zero mean process
+                    # values using power series
+                    cond_exp_func = np.polynomial.polynomial.polyfit(
+                                                    current_x_t_itm, 
+                                                    discounted_future_cashflows, 
+                                                    degree)
+                    # Evaluate the continuation values
+                    continuation_values = np.polynomial.polynomial.polyval(
+                                                            current_x_t_itm, 
+                                                            cond_exp_func)
+                else:
+                    raise ValueError('regression series not recognized.' 
+                                     + ' Enter as "Laguerre" or "power".')
+                # print(f'cond_exp_func: {cond_exp_func}')
+                # For each in-the-money short rate path, determine whether the 
+                # swaption will be exercised on the current monitor date or held 
+                # until the monitor date that corresponds to the next non-zero 
+                # cashflow
+                # cashflow_matrix[tenor_idx,
+                #                 itm_path_idxs] = np.where(current_exercise[itm_path_idxs] 
+                #                                           > continuation_values, 
+                #                                           current_exercise[itm_path_idxs], 
+                #                                           cashflow_matrix[tenor_idx,itm_path_idxs])
+                
+                # Determine the indices of the paths that were exercised in order 
+                # to set all their future cashflows to zero
+                exercised_itm_idxs = itm_path_idxs[np.where(current_exercise[itm_path_idxs] 
+                                                               > continuation_values)]
+                cashflow_matrix[ex_date_idx,exercised_itm_idxs] = current_exercise[exercised_itm_idxs]
+                cashflow_matrix[ex_date_idx+1:,exercised_itm_idxs] = 0
+                # print(f'time_T_m: {time_T_m}')
+                # print(f'ex_date_idx: {ex_date_idx}')
+                live_paths_array[ex_date_idx+2:,exercised_itm_idxs] = 0
+                pathwise_stopping_times[ex_date_idx,exercised_itm_idxs] = 1
+                pathwise_stopping_times[ex_date_idx+1:,exercised_itm_idxs] = 0
+            
+                # Plot the regression for each monitor date if selected by user
+                if plot_regression == True:
+                    plt.scatter(current_x_t_itm, 
+                                payoff_matrix[ex_date_idx,itm_path_idxs],
+                                label='Current Exercise', marker='x')
+                    plt.scatter(current_x_t_itm, 
+                                continuation_values, color='black',
+                             label='Continuation Values', s=1)
+                    plt.xlabel(r'Current $x_t$ for' 
+                               + r' Monitor Date $T_{fix}$' +f' = {time_T_m}')
+                    plt.ylabel('Value')
+                    plt.title('Least Squares Fit of' 
+                              + f' {regression_series.capitalize()} Series')
+                    plt.legend(loc='best')
+                    plt.show()
+                    plt.close()
+            
+    # Discount the swaption price back from expiry to time t
+    discount_factors_t_vector = eval_discount_factors(n_annual_trading_days, 
+                                                      r_t_paths, time_t, 
+                                                      exercise_dates[0])
+    swaption_price_vector = discount_factors_t_vector*cashflow_matrix[0]
+    
+    # print(f'payoff_matrix: {payoff_matrix[:,:5]}')
+    # print(f'cashflow_matrix: {cashflow_matrix[:,:5]}')
+            
+    if verbose:
+        # Print the LSM price and standard error
+        mean_price = np.mean(swaption_price_vector, dtype=np.float64)
+        standard_error = si.sem(swaption_price_vector)
+        print(f'Bermudan {swaption_type} swaption price: {mean_price}.' 
+              + f' Standard error: {standard_error}.')
+    
+    return ((swaption_price_vector*10**4/notional if units_basis_points 
+            else swaption_price_vector), live_paths_array, 
+            pathwise_stopping_times, cashflow_matrix)
+
+def future_price_Bermudan_swaption_LSM_Q(a_param: float, 
+                                         cashflow_matrix: list,
+                                         degree: int,
+                                         experiment_dir: str,
+                                         fixed_rate: float,
+                                         moneyness: float,
+                                         n_annual_trading_days: int,
+                                         notional: float,
+                                         payoff_var: str,
+                                         plot_regression: bool,
+                                         plot_timeline: bool,
+                                         regression_series: str,
+                                         r_t_paths: list,
+                                         sigma: float,
+                                         swaption_type: str,
+                                         tenor_structure: list,
+                                         time_t: float,
+                                         time_0_df0t_curve: list,
+                                         time_0_f_curve: list,
+                                         time_0_P_curve: list, 
+                                         units_basis_points: bool,
+                                         x_t_paths: list,
+                                         exercise_dates: list = None,
+                                         verbose: bool = False
+                                         ) -> list:
+    
+    # If specified, compute the moneyness-adjusted fixed rate
+    if moneyness is not None:
+        fixed_rate = eval_moneyness_adjusted_fixed_rate(moneyness, 
+                                                        n_annual_trading_days, 
+                                                        swaption_type, 
+                                                        tenor_structure, 
+                                                        time_0_P_curve)
+    
+    time_t_idx = int(time_t*n_annual_trading_days)
+    # current_x_t = x_t_paths[time_t_idx]
+    n_paths = np.shape(x_t_paths)[1]
+    # print(f'np.shape(current_x_t): {np.shape(current_x_t)}')
+    
+    ex_date_idx = np.searchsorted(exercise_dates, time_t)
+    exercise_date = exercise_dates[ex_date_idx]
+    # print(f'exercise_date: {exercise_date}')
+    discount_factors = eval_discount_factors(n_annual_trading_days, r_t_paths, 
+                                             time_t, exercise_date)
+    
+    # tenor_idx = np.searchsorted(tenor_structure, time_t)
+    # # print(f'time_t: {time_t}')
+    # # print(f'tenor_idx: {tenor_idx}')
+    # current_exercise = np.maximum(price_forward_start_swap(a_param, fixed_rate, 
+    #                                         n_annual_trading_days, notional, 
+    #                                         payoff_var, plot_timeline, 
+    #                                         r_t_paths, sigma, swaption_type, 
+    #                                         tenor_structure[tenor_idx:], 
+    #                                         time_t, 
+    #                                         time_0_f_curve, time_0_P_curve, 
+    #                                         units_basis_points, x_t_paths), 0)
+    # # print(f'mean current exercise: {np.mean(current_exercise)}')
+    
+    # itm_idxs = np.where(current_exercise>0)[0]
+    # otm_idxs = np.where(current_exercise<=0)[0]
+    # # print(f'np.shape(itm_idxs): {np.shape(itm_idxs)}')
+    # # print(f'itm_idxs: {itm_idxs}')
+    # # print(f'np.shape(otm_idxs): {np.shape(otm_idxs)}')
+    # # print(f'otm_idxs: {otm_idxs}')
+    # current_x_t_itm = current_x_t[itm_idxs]
+    # current_x_t_otm = current_x_t[otm_idxs]
+    
+    
+    
+    ZCBs_t = construct_zero_coupon_bonds_curve(a_param, experiment_dir, 
+                                                tenor_structure[-1], 
+                                                n_annual_trading_days, False, 
+                                                r_t_paths, sigma, time_t, 
+                                                time_0_f_curve, time_0_P_curve, 
+                                                x_t_paths)
+    tenor_idx = np.searchsorted(tenor_structure, time_t)
+    pathwise_swap_rates = eval_swap_rate(ZCBs_t, n_annual_trading_days, 
+                                          tenor_structure[tenor_idx:], time_t)
+    # # print(f'mean swap rate: {np.mean(pathwise_swap_rates)}')
+    # # print(f'fixed_rate: {fixed_rate}')
+    # # print(f'n_swap_rates > fixed_rate: {len(pathwise_swap_rates[pathwise_swap_rates>fixed_rate])}')
+    itm_idxs = np.where(pathwise_swap_rates<fixed_rate)[0]
+    otm_idxs = np.where(pathwise_swap_rates>=fixed_rate)[0]
+    # # print(f'len(itm_idxs): {len(itm_idxs)}')
+    # # print(f'len(otm_idxs): {len(otm_idxs)}')
+    
+    current_x_t_itm = pathwise_swap_rates[itm_idxs]
+    current_x_t_otm = pathwise_swap_rates[otm_idxs]
+    
+    # Obtain discounted future cashflows
+    if time_t == exercise_dates[-1]:
+        disc_future_cashflows_itm = np.zeros(len(itm_idxs))
+        disc_future_cashflows_otm = np.zeros(len(otm_idxs))
+    else:
+        future_cashflow_date_idx = np.searchsorted(exercise_dates, time_t, side='right')
+        print(f'time_t: {time_t}')
+        print(f'future_cashflow_date_idx: {future_cashflow_date_idx}')
+        print(f'exercise_dates[future_cashflow_date_idx]: {exercise_dates[future_cashflow_date_idx]}')
+        disc_factors = eval_discount_factors(n_annual_trading_days, r_t_paths, 
+                                              time_t, exercise_dates[future_cashflow_date_idx])
+        disc_future_cashflows_itm = (disc_factors[itm_idxs]
+                                     *cashflow_matrix[future_cashflow_date_idx,itm_idxs])
+        disc_future_cashflows_otm = (disc_factors[otm_idxs]
+                                     *cashflow_matrix[future_cashflow_date_idx,otm_idxs])
+        # disc_future_cashflows_itm = cashflow_matrix[ex_date_idx,itm_idxs]
+        # disc_future_cashflows_otm = cashflow_matrix[ex_date_idx,otm_idxs]
+    
+    # Regress the in-the-money and out-of-the-money future cashflows on the 
+    # current zero-mean process values
+    if regression_series.lower() == 'laguerre':
+        # Determine the conditional expectation function by regressing 
+        # the discounted future cashflows on the current zero mean process
+        # values using Laguerre polynomials and then evaluate the continuation 
+        # values
+        if len(itm_idxs):
+            cond_exp_func_itm = np.polynomial.laguerre.lagfit(current_x_t_itm, 
+                                                    disc_future_cashflows_itm, 
+                                                    degree)
+            continuation_values_itm = np.polynomial.laguerre.lagval(
+                                                    current_x_t_itm, 
+                                                    cond_exp_func_itm)
+        
+        if len(otm_idxs):
+            cond_exp_func_otm = np.polynomial.laguerre.lagfit(current_x_t_otm, 
+                                                    disc_future_cashflows_otm, 
+                                                    degree)
+            continuation_values_otm = np.polynomial.laguerre.lagval(
+                                                    current_x_t_otm, 
+                                                    cond_exp_func_otm)
+        
+    elif regression_series.lower() == 'power':
+        # Determine the conditional expectation function by regressing 
+        # the discounted future cashflows on the current zero mean process
+        # values using power series and then evaluate the continuation values
+        if len(itm_idxs):
+            cond_exp_func_itm = np.polynomial.polynomial.polyfit(current_x_t_itm, 
+                                                    disc_future_cashflows_itm, 
+                                                    degree)
+            continuation_values_itm = np.polynomial.polynomial.polyval(
+                                                    current_x_t_itm, 
+                                                    cond_exp_func_itm)
+        
+        if len(otm_idxs):
+            cond_exp_func_otm = np.polynomial.polynomial.polyfit(current_x_t_otm, 
+                                                    disc_future_cashflows_otm, 
+                                                    degree)
+            continuation_values_otm = np.polynomial.polynomial.polyval(
+                                                    current_x_t_otm, 
+                                                    cond_exp_func_otm)
+    else:
+        raise ValueError('regression series not recognized.' 
+                         + ' Enter as "Laguerre" or "power".')
+        
+    ## Plot continuation values
+    # plt.scatter(current_x_t_itm, 
+    #             continuation_values_itm, color='blue',
+    #          label='Continuation Values ITM', s=1)
+    # plt.scatter(current_x_t_otm, 
+    #             continuation_values_otm, color='red',
+    #          label='Continuation Values OTM', s=1)
+    # plt.axvline(x=fixed_rate, color='black', label='Fixed Rate', lw=1)
+    # plt.scatter(current_x_t_itm, 
+    #             disc_future_cashflows_itm, color='blue',
+    #          label='Discounted Future Cashflows ITM', s=1, alpha=.2)
+    # plt.scatter(current_x_t_otm, 
+    #             disc_future_cashflows_otm, color='red',
+    #          label='Discounted Future Cashflows OTM', s=1, alpha=.2)
+    # plt.xlabel(r'Current $S_{0,M}(t)$ for t = ' + f'{time_t}')
+    # plt.ylabel('Value')
+    # plt.title('Least Squares Fit of' 
+    #           + f' {regression_series.capitalize()} Series')
+    # plt.legend(loc='best')
+    # plt.show()
+    # plt.close()
+    
+    future_price_vector = np.zeros(n_paths)
+    if len(itm_idxs):
+        future_price_vector[itm_idxs] = np.maximum(continuation_values_itm, 0)
+        
+    if len(otm_idxs):
+        future_price_vector[otm_idxs] = np.maximum(continuation_values_otm, 0)
+    
+    return (future_price_vector*10**4/notional if units_basis_points 
+            else future_price_vector)
+
+def price_Bermudan_swaption_LSM_Q_OLD(a_param: float, 
+                                  degree: int,
+                                  experiment_dir: str,
+                                  fixed_rate: float,
+                                  moneyness: float,
+                                  n_annual_trading_days: int,
+                                  notional: float,
+                                  payoff_var: str,
+                                  plot_regression: bool,
+                                  plot_timeline: bool,
+                                  regression_series: str,
+                                  r_t_paths: list,
+                                  sigma: float,
+                                  swaption_type: str,
+                                  tenor_structure: list,
+                                  time_t: float,
+                                  time_0_df0t_curve: list,
+                                  time_0_f_curve: list,
+                                  time_0_P_curve: list, 
+                                  units_basis_points: bool,
+                                  x_t_paths: list,
                                   verbose: bool = False
                                  ) -> list:
     """
@@ -428,8 +1015,8 @@ def price_Bermudan_swaption_LSM_Q(a_param: float,
     # Determine the monitor dates that are relevant at the pricing time and 
     # adjust the tenor structure accordingly
     first_monitor_date_idx = np.searchsorted(tenor_structure, time_t)
-    print(f'time_t: {time_t}')
-    print(f'first_monitor_date_idx: {first_monitor_date_idx}')
+    # print(f'time_t: {time_t}')
+    # print(f'first_monitor_date_idx: {first_monitor_date_idx}')
     tenor_structure = tenor_structure[first_monitor_date_idx:]
     
     # Evaluate the number of paths and the tenor
@@ -583,7 +1170,7 @@ def price_Bermudan_swaption_LSM_Q(a_param: float,
     # Initialize array for storing all the optimal exercise strategy
     # live_paths_array = np.zeros(n_paths, dtype=int)
     live_paths_array = np.ones((tenor-1, n_paths), dtype=int)
-    pathwise_stopping_times = np.zeros_like(live_paths_array, dtype=int)
+    pathwise_stopping_times = np.zeros((tenor-1, n_paths), dtype=int)
             
     # Construct and evaluate matrix of discount factors from payment dates back 
     # to option expiry to find the optimal exercise strategy
@@ -629,8 +1216,11 @@ def price_Bermudan_swaption_LSM_Q(a_param: float,
     # Loop over all previously simulated short rate paths and evaluate the 
     # swaption price for each optimal stopping time on the first monitor date
     for p_idx in range(n_paths):
-        price =  (discount_factors_expiry_matrix[np.nonzero(live_paths_array[:,p_idx])[-1],p_idx]
+        if np.nonzero(cashflow_matrix[:,p_idx])[0].size >= 1:
+            price =  (discount_factors_expiry_matrix[np.nonzero(live_paths_array[:,p_idx])[-1],p_idx]
                   *payoff_matrix[np.nonzero(live_paths_array[:,p_idx])[-1],p_idx])[-1]
+        else:
+            price = 0.
         swaption_price_vector[p_idx] = price
             
     # Discount the swaption price back from expiry to time t
@@ -645,6 +1235,8 @@ def price_Bermudan_swaption_LSM_Q(a_param: float,
         standard_error = si.sem(swaption_price_vector)
         print(f'Bermudan {swaption_type} swaption price: {mean_price}.' 
               + f' Standard error: {standard_error}.')
+        
+        live_paths_array = np.concatenate((np.ones(n_paths), live_paths_array))
     
     return ((swaption_price_vector*10**4/notional if units_basis_points 
             else swaption_price_vector), live_paths_array, 
